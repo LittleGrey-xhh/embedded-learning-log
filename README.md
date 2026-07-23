@@ -2,6 +2,42 @@
 
 ---
 
+## 2026-07-23  理解 sizeof 与 strlen 的区别、sizeof(char) 恒为 1 的原因
+
+### 知识点
+- `sizeof` 是编译期运算符，返回对象或类型占用的内存字节数；`strlen` 是运行时函数，从地址开始扫描直到遇到 `'\0'` 并返回字符个数。
+- 指针变量只存储地址，`sizeof(指针)` 返回的是指针变量本身的大小（如 4 或 8 字节），与它指向的字符串长度无关。
+- 当用 `char arr[] = "..."` 定义数组时，`sizeof(arr)` 返回整个数组占用的字节数（包含编译器自动添加的 `'\0'`），因此可以间接得到字符数组的长度（但包含 `'\0'`）。
+- `sizeof(char)` 在任何平台都恒为 1，因为 C 标准规定 `char` 的大小是衡量所有存储的"基准单位"；"字节"在 C 中的定义就是"存放一个 `char` 所需的存储单元"，其宽度可以不是 8 位。
+- 可移植代码中，字符串长度应使用 `strlen`，内存大小应使用 `sizeof`，不要混用。
+
+### 踩过的坑
+- **错误直觉**：认为 `char *arr = "abcde abcde"; int len = sizeof(arr)/sizeof(arr[0]);` 能像数组一样得到字符串长度（比如 11）。  
+  **实际发生**：`sizeof(arr)` 拿到的是指针变量自身大小（我机器上是 8），除以 `sizeof(arr[0])`（即 `sizeof(char)`，值为 1），结果永远是 8 或 4，根本不是字符串长度。
+- **错误直觉**：以为 `sizeof(char) == 1` 是因为一个 char 就是 8 位、1 字节固定为 8 位。  
+  **实际发生**：C 语言的"字节"是以 `char` 的大小定义的，如果平台上的 `char` 是 16 位，那么 1 字节就是 16 位；`sizeof(char)` 恒为 1 是因为它本身就是度量其他类型的尺子，与具体多少位无关。
+
+### 正确做法
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main() {
+    char arr[] = "abcde abcde";   // 数组，包含整个字符串
+    char *ptr = "abcde abcde";    // 指针，仅存地址
+
+    printf("Array: sizeof=%zu, strlen=%zu\n", sizeof(arr), strlen(arr));
+    printf("Pointer: sizeof=%zu, strlen=%zu\n", sizeof(ptr), strlen(ptr));
+    return 0;
+}
+```
+核心思路：**数组名在定义作用域内用 `sizeof` 可得到总字节数（含 `\0`）；指针无论如何 `sizeof` 只得到指针变量本身大小。获取字符串长度统一用 `strlen`。**
+
+### 关键词
+sizeof strlen 指针 数组 编译期 运行时 char 字节 C标准 \0
+
+---
+
 ## 2026-07-20  数组退化与指针——函数传参的陷阱
 
 ### 知识点
