@@ -1,8 +1,230 @@
 # 嵌入式学习日记
 
+# 7.30笔记
+
+## 一、数据结构
+
+### 1.逻辑关系
+
+1.线性结构：一对一（数组，链表，栈，队列）
+2.非线性结果：不是一对一（树，堆，散列表，图）
+
+---
+
+### 2.物理关系
+
+1.顺序存储：数组（顺序结构）
+2.链式存储：链表（离散结构）
+
+---
+
+## 二、在写顺序表时遇到的问题
+
+我的理解：如果`SequenceList_Destory`传入的参数是一级指针，就要在主函数调用销毁后手动置空指针，如果传入的参数是二级指针，就不用手动置空。
+
+原因在于 **C 语言函数参数是值传递**。
+
+---
+
+### 1. 一级指针的情况
+
+```c
+void SequenceList_Destory(SList_t *manager)
+{
+    free(manager->addr);
+    free(manager);
+    // manager 是局部变量，指向已释放的内存
+}
+```
+
+调用时：
+
+```c
+SList_t *list = SequenceList_Create(10);
+SequenceList_Destory(list);
+// 此时 list 仍然保存着原来的地址值（野指针）
+```
+
+**原理：**  
+函数参数 `manager` 是 `list` 的一个**副本**。  
+你把 `list` 的值（某内存地址 0x1000）传进去，`manager` 也变成了 0x1000。  
+函数内部 `free(manager)` 只释放了 0x1000 处的内存，但 `manager` 这个局部变量本身和外面的 `list` 是**独立的两个变量**。  
+函数结束时 `manager` 被销毁，但 `list` 的值依然是 0x1000，就成了野指针。  
+所以**必须手动** `list = NULL`。
+
+---
+
+### 2. 二级指针的情况
+
+```c
+void SequenceList_Destory(SList_t **pp_manager)
+{
+    free((*pp_manager)->addr);
+    free(*pp_manager);
+    *pp_manager = NULL;   // 将外部指针置空
+}
+```
+
+调用时：
+
+```c
+SList_t *list = SequenceList_Create(10);
+SequenceList_Destory(&list);
+// 此时 list 自动变成 NULL
+```
+
+**原理：**  
+这次传的不是 `list` 的值，而是 **`list` 自己的地址**（`&list`）。  
+函数内部 `*pp_manager` 就是 **外面的 `list` 本身**。  
+所以 `*pp_manager = NULL` 这句话，直接修改了外部 `list` 的值。  
+函数结束后，`list` 就已经是 `NULL` 了，不需要再手动置空。
+
+---
+
+### 3. 直观对比
+
+| 方式 | 传进去的是什么 | 函数能修改外部的什么 |
+|------|----------------|---------------------|
+| 一级指针 `SList_t *` | 指针的**值**（地址副本） | 能修改**指针指向的内容**（如 `manager->last`），但**不能修改指针本身** |
+| 二级指针 `SList_t **` | 指针的**地址** | 既能修改指针指向的内容，**也能修改指针本身**（让它指向别处或置 NULL） |
+
+---
+
+### 4. 简单总结
+
+- 想改外部的 `int`，需要传 `int *`。  
+- 想改外部的 `SList_t *`（即修改指针本身），需要传 `SList_t **`。
+
+所以使用二级指针的销毁函数更“省心”，一次调用彻底安全；  
+用一级指针的版本则是“用完自己记得打扫”，需要手动 `list = NULL`，但代码看着更简洁。
+
+---
+
+## 三、踩的坑
+
+尝试在一级指针`void SequenceList_Destory(SList_t *manager)`里面写`*manager = NULL`，同时调用的时候也传list的地址`SequenceList_Destory(&list);`
+
+结论：**不行**，这样做会导致编译错误，而且逻辑上也不对。分两点说清楚：
+
+---
+
+### 1. 类型不匹配
+
+```c
+void SequenceList_Destory(SList_t *manager)
+{
+    free(manager->addr);
+    free(manager);
+    *manager = NULL;   // ❌ 编译错误
+}
+```
+
+这里的 `manager` 是 `SList_t *` 类型，`*manager` 就是 **一个 `SList_t` 结构体**。  
+`NULL` 是指针类型的空值（通常定义为 `(void*)0`），**不能赋值给结构体变量**。  
+编译器会直接报错：
+
+```text
+error: incompatible types when assigning to type ‘SList_t’ from type ‘void *’
+```
+
+---
+
+### 2. 即使强行转换，意义也不对
+
+如果非要写 `*manager = (SList_t){0};` 之类的东西，那只是把 `manager` 指向的结构体内容清空。但——
+
+此时 `manager` 刚被 `free` 掉，它指向的内存已经不可访问，`*manager` 本身就是**未定义行为**。而且做完这个操作，外部的 `list` 指针**依然是原来的地址值**，并没有变成 `NULL`。
+
+---
+
+### 3. 如果用 `SequenceList_Destory(&list)` 调用
+
+假设写的是：
+
+```c
+SList_t *list = SequenceList_Create(10);
+SequenceList_Destory(&list);   // 但函数定义是 SList_t *manager
+```
+
+`&list` 的类型是 `SList_t **`，而函数参数类型是 `SList_t *`，**类型不匹配**，编译器会报警告或错误（取决于设置）。就算勉强通过，传给 `manager` 的也是 `list` 的地址（一个二级指针值），把它当作一级指针去访问 `manager->addr` 会直接崩溃。
+
+---
+
+### 4. 总结
+
+- **用一级指针**：函数里 `free(manager)` 释放的是 `list` 指向的内存，但 `list` 本身不变，需要**调用后手动 `list = NULL`**。
+- **用二级指针**：函数里 `*pp_manager = NULL` 直接修改外部 `list` 指针，因为 `*pp_manager` 就是外面的 `list`，类型是 `SList_t *`，赋值 `NULL` 合法。
+
+如果不用二级指针，那就需要走“手动置空”这个步骤。没有其他让一级指针函数自动置空外部指针的办法。
+
+---
+
+## 四、对以往的知识点回顾（sizeof和strlen的区别）
+
+### 1. 对数组与指针的行为
+
+这是最易混淆的地方：
+
+| 情况 | `sizeof` | `strlen` |
+|------|----------|----------|
+| 字符数组 `char arr[] = "hello";` | 6（包含 `'\0'`） | 5 |
+| 字符串字面量 `"hello"` | 6（包含 `'\0'`） | 5 |
+| 指针 `char *p = "hello";` | 指针本身大小（4 或 8 字节） | 5（按指向内容计算） |
+| 数组作为函数参数退化为指针时 | 指针大小，而非原数组大小 | 仍求字符串长度（需有 `'\0'`） |
+
+**关键**：数组名在 `sizeof` 中不会退化为指针，在函数参数中会。
+
+---
+
+### 2. 常见陷阱总结
+
+- 将数组传入函数后，用 `sizeof` 求大小只会得到指针大小。
+- 用 `strlen` 处理可能没有 `'\0'` 的字符数组（如网络数据包）会导致越界。
+- 混淆 `sizeof("abc")`（4）和 `strlen("abc")`（3）。
+- 以为 `sizeof` 是函数而写成 `sizeof` 后有空格，其实它是运算符，`sizeof expr` 可省略括号，但 `sizeof(type)` 必须加括号。
+
+---
+
+### 3. 速查对比表
+
+| 对比项 | `sizeof` | `strlen` |
+|--------|----------|----------|
+| 类型 | 运算符 | 库函数 |
+| 求值时机 | 编译时（VLA 除外） | 运行时 |
+| 功能 | 内存占用字节数 | 字符串字符数 |
+| 头文件 | 无需 | `<string.h>` |
+| 参数 | 类型或表达式 | `const char*` |
+| 是否包含 `'\0'` | 若存在则计入 | 不计入 |
+| 数组与指针 | 区分数组名和指针 | 只关心指向的内容 |
+| 未初始化/无 `'\0'` | 仍安全返回大小 | 未定义行为 |
+
+---
+
+### 4. 代码实例
+
+注意：sizeof 在编译期求值时，只关心操作数的类型，不实际计算操作数的值。
+
+```c
+#include <stdio.h>
+
+int main() {
+    int i = 10;
+
+    printf("sizeof(i++) = %zu\n", sizeof(i++));  // 输出 sizeof(int)，通常是 4
+    printf("sizeof(++i) = %zu\n", sizeof(++i));  // 输出 sizeof(int)，通常是 4
+    printf("i = %d\n", i);                       // i 仍然是 10
+
+    // 对比：正常的 ++i
+    ++i;
+    printf("After normal ++i, i = %d\n", i);     // i 变成 11
+    return 0;
+}
+```
+
 ## 2026-07-28 跨平台类型字节长度与运算符右结合性
 
 ### 跨平台(32位->64位)字节长度速查：不变类型 vs 变化类型
+
 ---
 
 #### 大小不变的类型（与系统位数无关）
