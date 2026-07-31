@@ -1,5 +1,82 @@
 # 嵌入式学习日记
 
+# 7.31笔记
+
+## 一、在写链表时踩得坑
+
+### 1.尾插法代码的错误顺序
+
+```c
+
+manager->tail       = new_node;   // tail 直接跳到新节点
+manager->tail->next = new_node;   // 此时 tail->next 就是 new_node->next，指向自己！
+
+```
+
+**执行效果：**
+
+1. `tail` 立即变成 `new_node`，原来尾节点的地址丢失了。
+
+2. 接着执行 `manager->tail->next = new_node;` 等价于 `new_node->next = new_node;` —— 新节点指向自己，形成自环。
+
+3. 原链表尾部节点（之前真正的尾节点）的 `next` 依然是 `NULL`，链表被截断，丢失了与新节点的连接。
+
+---
+
+**为什么：**
+
+1. 原来`manager->tail = new_node`的意思就是直接改变尾巴的地址，如果第一步就改变地址之后尾巴就直接变成了新的节点，那么旧的节点就没了，就无法让原先是尾巴节点指针指向现在新的尾巴节点了
+
+2. 第二步执行`manager->tail->next = new_node`此时`manager->tail`存的已经是改变过的新尾巴节点了，再让他`->next = new_node`就相当于指向他自己
+
+---
+
+### 2.尾插的正确做法
+
+```c
+manager->tail->next = new_node;   // 原尾节点的 next 指向新节点
+manager->tail       = new_node;   // 更新尾指针，指向新的尾节点
+```
+
+---
+
+**完整代码:**
+
+```c
+bool LinkedList_TailInsert(Manager_t *manager, DataType_t val){
+    if(manager == NULL){
+        return false;
+    }
+
+    // 1.创建一个新节点
+    Node_t *new_node = LinkedList_NewNode(val);
+    if(new_node == NULL){
+        printf("创建新节点失败\n");
+        return false;
+    }
+
+    // 2.插入前判断链表是否为空
+    // 如果链表为空，则新节点既是头结点也是尾结点
+    if(manager->first == NULL){
+        manager->first  = new_node;
+        manager->tail   = new_node;
+    }
+    // 如果链表不为空，则新节点
+    else{
+        manager->tail->next = new_node;
+        manager->tail       = new_node;
+    }
+}
+
+    // 3.链表节点数加1
+    manager->num += 1;
+
+    return true;
+
+```
+
+---
+
 # 7.30笔记
 
 ## 一、数据结构
