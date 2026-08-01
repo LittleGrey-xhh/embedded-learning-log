@@ -1,5 +1,160 @@
 # 嵌入式学习日记
 
+# 8.1笔记
+
+## 一、头删法代码犯的错误
+
+### 错误做法
+
+```c
+bool CircularLinkedList_HeadDelete(Manager_t *manager){
+    if(manager == NULL){
+        printf("参数错误，该链表结构不存在\n");
+        return false;
+    }
+    if(manager->first == NULL){
+        printf("链表为空，无法删除\n");
+        return false;
+    }    
+    
+    // 1.定义一个临时变量来存放首节点的地址
+    Node_t *tmp = manager->first;    
+    
+    // 2.将首节点的下一个节点作为新的首节点
+    manager->first = manager->first->next;
+
+    
+    // 3.释放掉原来的首节点
+    if(manager->first == NULL){
+        // 删除后如果链表为空，必须把尾指针也置空
+        manager->tail = NULL;
+    }
+    else{
+        // 删除后如果链表不为空，必须将尾节点的next指向新的首节点
+        manager->tail->next = manager->first;
+    }    
+    free(tmp);
+    tmp = NULL;    
+    
+    // 4.链表节点数减1
+    manager->num -= 1;  
+
+    
+    return true;
+}
+```
+
+代码有一个**致命的逻辑错误**，和单链表的习惯用法不同：**在单向循环链表中，如果只有一个节点，`first->next` 指向自己，执行 `manager->first = manager->first->next` 后 `first` 仍然是原来的地址，并不会变成 `NULL`。**
+
+这会导致：
+
+1. **`manager->first == NULL` 这个分支永远不会执行**。  
+2. 程序会错误地走入 `else` 分支，执行 `manager->tail->next = manager->first`，而此时那个唯一的节点已经被 `free` 了，**访问已释放内存**，未定义行为（崩溃或逻辑错乱）。  
+3. 删完后 `first` 和 `tail` 都还指向已释放的节点，成为悬挂指针。
+
+---
+
+### 正确做法
+
+必须**单独处理链表只剩一个节点的情况**，判断条件通常是 `manager->first == manager->tail`（且非空）。
+
+#### 修正版代码
+
+```c
+bool CircularLinkedList_HeadDelete(Manager_t *manager)
+{
+    if (manager == NULL) {
+        printf("参数错误，该链表结构不存在\n");
+        return false;
+    }
+    if (manager->first == NULL) {
+        printf("链表为空，无法删除\n");
+        return false;
+    }
+
+    Node_t *tmp = manager->first;
+
+    // 情况1：链表中只有一个节点
+    if (manager->first == manager->tail) {
+        manager->first = NULL;
+        manager->tail = NULL;
+    }
+    // 情况2：多个节点
+    else {
+        manager->first = manager->first->next;   // 首节点后移
+        manager->tail->next = manager->first;    // 尾节点指向新的首节点，保持循环
+    }
+
+    free(tmp);
+    tmp = NULL;
+
+    manager->num -= 1;
+    return true;
+}
+```
+
+---
+
+### 为什么需要这样改？
+
+- **单节点链表**：直接置空 `first` 和 `tail`，表示链表已空，循环结构自然消失。
+- **多节点链表**：先移动 `first`，再让 `tail->next` 指向新的 `first`，保证环不断裂，且不访问已释放内存。
+
+原来的思路（通过 `first == NULL` 判断链表变空）只适用于非循环链表，循环链表里不可能通过移动 `first` 得到 `NULL`（除非错误地断开环，但那就不是循环链表了）。
+
+---
+
+### 延伸
+
+- **尾删**也会遇到类似问题：当只剩一个节点时，不能用通用逻辑，需要单独处理。
+- 删除中间节点也要注意更新 `tail`（如果删除的是尾节点）和维持环的连接。
+
+---
+
+## 二、销毁代码犯的错误
+
+### 1.错误做法
+
+```c
+free(p);              // 1. 假设这里释放的是首节点
+p = next;             // 2. p 指向了下一个节点（有效）
+if(p == manager->first){  // 3. 比较：p 有效，但 manager->first 已经是被释放的地址！
+    break;
+}
+```
+
+- 当 `p` 第一次进入循环，指向首节点并释放后，`manager->first` 这个成员变量**仍然保存着刚刚被释放的首节点地址**，变成了悬垂指针。
+- 接下来的 `if(p == manager->first)` 是在用**有效地址**（下一个节点）和**无效地址**（已释放的首节点）做比较。
+- C 标准规定，使用已释放指针的值进行比较属于**未定义行为**（哪怕只是读它的值）。实际中，编译器可能假设这块内存已无效，优化后产生意想不到的结果，比如永不相等导致死循环，或碰巧相等导致提前退出。
+
+---
+
+### 2.正确的终止方式
+
+有一个简单且完全正确的方式是：
+**先断开环**，再遍历销毁，与普通单链表销毁完全一致。
+
+```c
+// 断开环：尾节点 next 置 NULL
+manager->tail->next = NULL;
+
+// 普通遍历销毁
+Node_t *p = manager->first;
+while (p != NULL) {
+    Node_t *next = p->next;
+    free(p);
+    p = next;
+}
+```
+
+这样完全避免了和已释放地址比较的问题，也是最推荐的循环链表销毁方法。
+
+---
+
+**总结**： `manager->first` 的“值”已经变成无效地址，拿它和有效地址比较就是错误的根源
+
+下次再遇到销毁单向循环链表时，直接**先断开环**，再遍历销毁。
+
 # 7.31笔记
 
 ## 一、在写链表时踩得坑
