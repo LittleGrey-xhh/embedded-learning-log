@@ -1,5 +1,142 @@
 # 嵌入式学习日记
 
+# 系统 IO 学习笔记（2026-08-10）
+
+## 一、两套 IO API（分清层级）
+
+| 层级 | 函数 | 返回类型 | 惯用命名 | 特点 |
+|---|---|---|---|---|
+| 系统调用 | open / read / write / close / lseek | `int fd` 文件描述符 | `fd` | 无缓冲，直接跟内核打交道 |
+| 标准库 | fopen / fread / fprintf / fgets / fclose | `FILE *fp` 流指针 | `fp` | 带缓冲，是系统调用的封装 |
+
+- `fopen` 内部就是 `open` + 一层缓冲 + 格式化工具；`fileno(fp)` 可取出底层 fd
+- 命名约定：**open 配 fd，fopen 配 fp**，一眼分清用的是哪套
+- 应用场景：普通文件读写用 stdio；网络、管道、文件锁、非阻塞、fcntl/ioctl 必须用系统调用
+
+## 二、核心概念
+
+### 1. 文件偏移（重点中的重点）
+- 偏移存在**内核的"打开文件描述"里，不在 C 变量里**
+- `read`/`write` 每次自动推进偏移；read 是"消费品"，读走就没了
+- **想有独立偏移只有一条路：重新 `open`**（函数/局部变量隔离不了，形参只是复制"门牌号"）
+- `dup` 复制的 fd 共享偏移
+
+### 2. 覆盖写 vs 清空重写
+- `lseek` 管"写到哪"（position）；`O_TRUNC`/`ftruncate` 管"文件多长"（length）——两个维度
+- `lseek(0) + write` = 从开头覆盖 N 字节，**尾部旧数据残留**
+- `O_TRUNC + write` = 先清空再写，无残留
+- 经验：改文件中间某段用 lseek；整个重写用 O_TRUNC
+
+### 3. EOF 与 '\0'（字符串思维 vs 文件思维）
+- `read` 返回 **0 = EOF**（靠文件系统记录的长度判断，不靠 '\0'）；**-1 = 出错**
+- 文件是字节序列不是字符串，不需要 '\0' 结尾
+- '\0' 只是内存字符串函数（`%s`/`strlen`）的约定
+- **`read` 不自动补 '\0'**，要用字符串处理必须手动 `buf[len] = '\0'`
+
+## 三、分块拷贝模板（背下来）
+
+```c
+char buf[1024];
+int len;
+while ((len = read(fd, buf, sizeof(buf))) > 0) {   // 括号必须包住赋值！
+    if (write(fd2, buf, len) != len) {             // 检查 write 是否写全
+        perror("write");
+        break;
+    }
+}
+if (len == -1) perror("read");
+```
+
+- 每次最多搬 1024 字节，最后一块可能不足
+- 写 `len` 而不是 `sizeof(buf)`，否则尾部塞垃圾
+- 读文件的循环中间**绝对不能插任何别的 read**（会消费偏移）
+
+## 四、今天踩过的坑（复习清单）
+
+1. **open 失败不 return** → 拿 -1 fd 继续操作 → read 返回 -1 → 甚至 `buf[-1]` 越界写
+2. **read 后不补 '\0' 就 %s 打印** → 越界读到垃圾/乱码
+3. **调试 read 插在拷贝循环中间** → 偏移被偷吃，拷贝为空或丢内容
+4. **优先级 bug：`len = read(...) > 0`** → 实际是 `len = (read(...) > 0)`，len 变 0/1，每次只写 1 字节
+5. **函数返回局部数组指针** → 悬空指针，栈已回收
+6. **`open("name")` 字面量 vs 参数 `name`** → 打开的文件叫 "name"
+7. **目标文件缺 `O_CREAT`**（不存在打不开）/ **缺 `O_TRUNC`**（旧数据残留）
+8. **权限**：文件用 `0644`（`0755` 是给目录的）；源文件用 `O_RDONLY`
+9. **资源管理**：谁打开谁负责 close；fd 可 return 跨函数传递，但没人 close 就是泄漏（`ulimit -n` 限制）
+10. **失败处理**：打印错误后必须 `return`，不能"打印完假装没事"
+
+## 五、遗留提醒
+
+- 拷贝循环里 `printf("%s", buf)` 打印内容仍有隐患（源文件 ≥1024 字节时 buf 无 '\0'），调试建议只打印字节数
+- `perror()` 比 `printf("失败\n")` 有用，能打出具体错误原因
+
+## 六、完整无误的示例代码（文件拷贝）
+
+```c
+#include <unistd.h>
+#include <stdio.h>
+#include <fcntl.h>
+
+// 打印文件前 1023 字节的内容（独立 open，不影响其他 fd 的偏移）
+void printFile(const char *name) {
+    int fd = open(name, O_RDONLY);          // 只读打开
+    if (fd == -1) {
+        perror("open");
+        return;                              // 失败立刻退出
+    }
+    char buf[1024];
+    int len = read(fd, buf, sizeof(buf) - 1);   // 留一位放 '\0'
+    if (len == -1) {
+        perror("read");
+        close(fd);
+        return;                              // 失败立刻退出
+    }
+    buf[len] = '\0';                         // read 不补 '\0'，手动加
+    printf("%s 的内容是 %s\n", name, buf);
+    close(fd);
+}
+
+int main() {
+    // 源文件：只读打开
+    int fd = open("源文件.txt", O_RDONLY);
+    if (fd == -1) {
+        perror("open 源文件");
+        return 1;
+    }
+
+    // 目标文件：只写 + 不存在则创建 + 先清空，权限 0644
+    int fd2 = open("目标文件.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd2 == -1) {
+        perror("open 目标文件");
+        close(fd);
+        return 1;
+    }
+
+    printFile("源文件.txt");      // 拷贝前看一眼（目标文件已被 O_TRUNC 清空）
+    printFile("目标文件.txt");
+
+    // 分块拷贝：read 最多搬 1024 字节，读到 EOF（返回 0）结束
+    char buf[1024];
+    int len, i = 0;
+    while ((len = read(fd, buf, sizeof(buf))) > 0) {   // 括号必须包住赋值
+        if (write(fd2, buf, len) != len) {   // 检查 write 是否写全
+            perror("write");
+            break;
+        }
+        printf("第 %d 次拷贝 %d 字节\n", ++i, len);   // 只打印长度，不打印内容
+    }
+    if (len == -1) perror("read");           // read 出错
+
+    close(fd);
+    close(fd2);
+
+    printFile("源文件.txt");      // 拷贝后验证
+    printFile("目标文件.txt");
+    return 0;
+}
+```
+
+---
+
 # 8.6-8.8 项目笔记
 
 ## 进阶知识
