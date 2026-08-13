@@ -1,5 +1,331 @@
 # 嵌入式学习日记
 
+# 系统 IO 学习笔记（2026-08-13）
+
+## 一、LCD屏幕
+
+### 帧缓冲(Framebuffer)
+
+1.定义：
+
+在Linux系统下是利用`Framebuffer`子系统来驱动显示设备的，所以`Framebuffer`子系统会读取LCD屏的硬件信息并存储在内核空间中，关于LCD的硬件参数都是定义在`/usr/include/linux/fb.h`头文件中。
+
+通过`fb.h`可以看到头文件中存在三个比较重要的结构体，分别是`struct fb_fix_screeninfo`以及`struct fb_var_screeninfo`以及`struct fb_bitfield`，除了这三个结构体之外，可以发现头文件中存在大量的宏定义，用户可以通过这些宏定义来指定读取LCD的部分信息。
+
+2.struct fb_fix_screeninfo结构体：
+
+`struct fb_fix_screeninfo`结构体主要用于获取`FrameBuffer`的固定参数，用户无法在应用层修改这些参数，只能通过系统调用`ioctl`函数使用宏定义`FBIOGET_FSCREENINFO`去获取这些参数。
+
+3.struct fb_var_screeninfo结构体：
+
+`struct fb_var_screeninfo`结构体主要用于获取和设置`FrameBuffer`的可变屏幕参数，包括分辨率、像素位深、像素格式等。这些信息可以通过`ioctl`函数使用宏定义`FBIOGET_VSCREENINFO`获取，也可以通过宏定义`FBIOPUT_VSCREENINFO`修改。
+
+---
+
+### 文件控制
+
+Linux系统提供了一个`ioctl`（input/outputcontrol）函数，该函数是一个专用于设备输入输出操作的系统调用，该调用传入一个跟设备有关的请求码，系统调用的功能完全取决于请求码（FBIOGET_VSCREENINFO）。
+
+追加：
+参数不是"本来就有"的。`struct fb_var_screeninfo lcd_into;` 这一句只是给变量分配了一块内存，里面全是垃圾值/零，什么都还没有。
+
+`ioctl(fd_lcd, FBIOGET_VSCREENINFO, &lcd_into)` 的机制是：你把空表的地址（`&lcd_into`）递给内核，内核去读取 LCD 驱动的硬件配置，把结果写进这张表再返回。内核才是填表的人，你只是递了张空表过去。
+
+个人理解：
+所以说`ioctl`就是一个加工厂，拿着`fd_lcd`这个门牌号（原材料从哪里来），`FBIOGET_VSCREENINFO`（要对原材料干什么，怎么加工），`&lcd_into`（干完谁来收货），我这么理解对吗？
+
+ds回答：
+比喻贴切，方向也抓对了——**fd 是"哪台设备"、命令是"干什么"、第三个参数是"数据放哪/从哪拿"**。但我要给你补一个关键概念：**方向**。ioctl 的命令分两类，方向正好相反：
+
+- **GET 类**（问信息）：内核 → 你。工厂加工完把货给你。`FBIOGET_VSCREENINFO` 就是这类，你的比喻完全成立。
+- **SET 类**（下命令）：你 → 内核。你送配置进去，内核去配置硬件。工厂按你的图纸开工。
+
+### framebuffer 常用 ioctl（你最该记住的这组）
+
+| 命令 | 干什么 | 方向 |
+|---|---|---|
+| `FBIOGET_VSCREENINFO` | 获取可变参数：**分辨率、色深** | 内核→你（你已会用） |
+| `FBIOGET_FSCREENINFO` | 获取固定参数：**line_length（行字节数）、smem_len（显存大小）** | 内核→你（我们代码用过，拿 line_length） |
+| `FBIOPUT_VSCREENINFO` | **设置**分辨率、色深（驱动层改屏幕配置） | 你→内核 |
+| `FBIOPAN_DISPLAY` | 设置显示起始偏移（实现画面滚动、双缓冲切换） | 你→内核 |
+| `FBIO_WAITFORVSYNC` | 等待屏幕刷完一帧（写图前等它，**防画面撕裂**） | 你→内核 |
+
+对应的模式都长一个样：
+
+```c
+struct fb_var_screeninfo vinfo;              // 空表
+ioctl(fd, FBIOGET_VSCREENINFO, &vinfo);      // GET：内核填表
+// 改配置后再写回
+vinfo.xres = 1024;
+ioctl(fd, FBIOPUT_VSCREENINFO, &vinfo);      // SET：你递表，内核执行
+```
+
+### 其他设备也各有一堆 ioctl
+
+| 设备 | 常用命令 | 用途 |
+|---|---|---|
+| 终端 tty | `TCGETS` / `TCSETS` | 获取/设置串口终端参数（波特率、回显开关） |
+| RTC 时钟 | `RTC_RD_TIME` / `RTC_SET_TIME` | 读/写硬件实时时钟 |
+| 网卡 | `SIOCGIFADDR` | 获取网卡 IP 地址 |
+| 磁盘 | `BLKGETSIZE64` | 获取磁盘大小（字节数） |
+| 摄像头 V4L2 | `VIDIOC_QUERYCAP` / `VIDIOC_S_FMT` | 查询能力、设置采集格式 |
+
+规律看出来了没？**所有 ioctl 都是三件套：`ioctl(fd, 命令, 数据地址)`**。不同的只是：
+
+- `fd` 换成不同的设备文件
+- 命令宏换成那个设备定义的那组
+- 数据地址换成对应的结构体
+
+---
+
+### 大体步骤
+
+1. 打开LCD设备文件`open`
+2. 获取LCD设备信息`ioctl`
+3. 申请内存映射`mmap`
+4. 操作映射后的内存空间
+5. 解除映射，关闭文件
+
+---
+
+### 具体实现
+
+1.按字节拼小端整数
+
+```c
+static unsigned int le32(const unsigned char *p){
+    return (unsigned)p[0] | ((unsigned)p[1] << 8)
+         | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+```
+
+2.open读.bmp图片参数
+
+```c
+// 1.打开bmp，读54字节头
+    int fd_bmp = open("/root/feibi.bmp", O_RDONLY);
+    if(fd_bmp == -1){ perror("open bmp fail"); return -1; }
+
+    unsigned char header[54];
+    if(read(fd_bmp, header, 54) != 54){ perror("read header"); close(fd_bmp); return -1; }
+    if(header[0] != 'B' || header[1] != 'M'){ printf("not bmp\n"); close(fd_bmp); return -1; }
+
+    unsigned int img_w = le32(header + 18);   // 图片宽
+    unsigned int img_h = le32(header + 22);   // 图片高
+    unsigned int offset = le32(header + 10);  // 像素数据偏移
+    printf("bmp: %ux%u\n", img_w, img_h);
+```
+
+3.open拿到LCD的门牌号,
+定义结构体空表lcd_into，
+用ioctl向内核拿到LCD参数后填表
+
+```c
+// 2.打开LCD + mmap（屏幕大小，用 lcd_into）
+    int fd_lcd = open(LCD_PATH, O_RDWR);
+    if(fd_lcd == -1){ perror("open lcd fail"); return -1; }
+
+    struct fb_var_screeninfo lcd_into;
+    if(ioctl(fd_lcd, FBIOGET_VSCREENINFO, &lcd_into) == -1){
+        perror("ioctl fail"); return -1;
+    }
+```
+
+4.内存映射
+
+```c
+int *lcd_p = mmap(NULL, lcd_into.xres * lcd_into.yres * 4,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, fd_lcd, 0);
+    if(lcd_p == MAP_FAILED){ perror("mmap fail"); return -1; }
+```
+
+5.申请内存、读像素、转换、倒序拷贝（接续上段，同一 main 函数的剩余部分）
+
+```c
+    // 按图片大小申请内存（不是屏幕大小！）
+    unsigned char *bmp_buf = (unsigned char *)malloc(img_w * img_h * 3);
+    int *lcd_buf = (int *)malloc(img_w * img_h * 4);
+    if(!bmp_buf || !lcd_buf){ printf("malloc fail\n"); return -1; }
+
+    // 跳到像素数据（用文件头的 offset，不写死 54）
+    lseek(fd_bmp, offset, SEEK_SET);
+    read(fd_bmp, bmp_buf, img_w * img_h * 3);
+
+    // 4.转换：循环用图片像素数
+    for(unsigned int i = 0; i < img_w * img_h; i++){
+        lcd_buf[i] = 0xFF000000u | bmp_buf[i*3] | bmp_buf[i*3+1] << 8 | bmp_buf[i*3+2] << 16;
+    }
+
+    // 5.倒序拷贝：源行按图片宽，目标行按屏幕宽
+    for(unsigned int y = 0; y < img_h && y < lcd_into.yres; y++){
+        memcpy(&lcd_p[y * lcd_into.xres],       // 屏幕第 y 行
+               &lcd_buf[(img_h - 1 - y) * img_w],  // 图片第 (img_h-1-y) 行
+               img_w * 4);                      // 一次拷图片的一整行
+    }
+
+    // 6.收尾
+    free(bmp_buf);
+    free(lcd_buf);
+    munmap(lcd_p, lcd_into.xres * lcd_into.yres * 4);
+    close(fd_lcd);
+    close(fd_bmp);
+    return 0;
+}
+```
+
+---
+
+## 二、关键概念（为什么这么写）
+
+### 1. 大小端（字节序）—— 为什么要有 le32
+
+- BMP 文件存**多字节整数**时用**小端**：低位字节在前。
+- 例：宽度 800 = 0x00000320，文件里 4 个字节是 `20 03 00 00`（低字节 0x20 在最前面）。
+- `le32` 把 4 个字节按小端顺序拼回整数：`p[0] | p[1]<<8 | p[2]<<16 | p[3]<<24`。
+- 拼错（按书写习惯大端拼）会把 800 读成 0x20030000（5 亿多），直接崩。
+- **字节序只影响多字节整数**；像素数据是按字节排的 BGR 流，与字节序无关，不用转换。
+- `le32` 正好读 4 字节 = int 宽度，不多不少，不用裁剪；读 2 字节字段用 `le16`。
+
+### 2. BMP 文件头结构（54 字节）
+
+| 偏移 | 内容 | 代码读取 |
+|---|---|---|
+| 0~1 | 'B' 'M' 文件类型标识 | 校验，不是就报错退出 |
+| 10~13 | 像素数据偏移 offset | `le32(header + 10)` |
+| 18~21 | 图片宽度 | `le32(header + 18)` |
+| 22~25 | 图片高度 | `le32(header + 22)` |
+| 28~29 | 色深 bpp | `le16(header + 28)` |
+
+- 为什么要用 `offset` 而不是写死 54：文件头不总是 54 字节（可能带调色板、扩展头），offset 是文件自己声明的像素数据真实位置，永远准确。
+- 注意：`header[18]~[21]` 只是"宽度"这个数的 4 个零件，不是宽度本身；`le32` 是把零件按小端顺序组装成完整数值。
+
+### 3. 像素格式转换：BGR → ARGB8888
+
+- BMP 24bpp 每个像素 3 字节，顺序是 **B G R**；LCD 32bpp 每个像素 4 字节，顺序是 **A R G B**。
+- 转换核心：`0xFF000000u | b<<0 | g<<8 | r<<16`（R 与 B 交换位置，前面补 A）。
+- `0xFF` 是 A 通道（不透明）。不补时 A=0，部分驱动会黑屏；自己的屏恰好忽略 A 所以能显示，但标准写法要补。
+
+### 4. BMP 自底向上 → 倒序拷贝
+
+- BMP 文件第一行 = 图片**最底行**（bottom-up 存储）。
+- 屏幕第 0 行要显示图片最顶行 = 文件的最后一行。
+- 所以 `lcd_p[y * 屏幕宽] ← lcd_buf[(高-1-y) * 图片宽]`，y 正序走、行号倒着取。
+- 坐标系理解：屏幕坐标 y 与文件行号 (高-1-y) 一一镜像，**翻转只发生在 y 轴，x 轴原样搬运**。
+
+### 5. mmap 原理与六参数
+
+为什么用 mmap：`read/write` 要经过内核缓冲区两次拷贝；mmap 把 LCD 显存（物理内存）直接映射进进程虚拟地址空间，`lcd_p` 指向显存本身——写数组 = 写显存 = 改屏幕，零拷贝。
+
+| 参数 | 代码 | 含义 |
+|---|---|---|
+| addr | NULL | 让内核自己选地址 |
+| length | xres * yres * 4 | 映射大小 = 像素数 × 每像素 4 字节 |
+| prot | PROT_READ \| PROT_WRITE | 权限：可读可写 |
+| flags | MAP_SHARED | 共享映射，改动直接回写设备 |
+| fd | fd_lcd | 映射哪个设备 |
+| offset | 0 | 从设备开头映射 |
+
+- 套路固定、数值不固定：length 按资源大小，fd 按对象，权限按需求。
+
+### 6. ioctl 填表机制（补充）
+
+- 定义结构体只是准备**空表**，`ioctl` 让内核读硬件参数填进表里返回。
+- GET 类（内核 → 你，问信息）vs SET 类（你 → 内核，下命令）。
+- 万能三件套：`ioctl(fd, 命令宏, 数据地址)`，换设备就换 fd 和命令宏。
+
+---
+
+## 三、常见坑总结（必背）
+
+1. 没跳过 BMP 文件头 → 整张图错位（用 `lseek(fd_bmp, offset, SEEK_SET)`）
+2. `char` 有符号 → 像素 >127 颜色错乱，必须 `unsigned char`
+3. 没补 A 通道 → 可能黑屏（标准写法 `0xFF000000u |`）
+4. BMP 自底向上没倒序 → 图上下颠倒
+5. 栈上大数组（2.6MB）→ 嵌入式栈小，改用 `malloc` + `free`
+6. 分辨率写死 → 图片宽高从 BMP 头读（img_w/img_h），屏幕大小从 lcd_into 读（xres/yres），各归其位
+
+---
+
+## 四、完整代码（通用版：图片多大都能显示，不超屏即可）
+
+```c
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
+
+#define LCD_PATH "/dev/fb0"
+
+// 按字节拼小端整数，免疫字节序
+static unsigned int le32(const unsigned char *p){
+    return (unsigned)p[0] | ((unsigned)p[1] << 8)
+         | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+int main(){
+    // 1.打开bmp，读54字节头
+    int fd_bmp = open("/root/feibi.bmp", O_RDONLY);
+    if(fd_bmp == -1){ perror("open bmp fail"); return -1; }
+
+    unsigned char header[54];
+    if(read(fd_bmp, header, 54) != 54){ perror("read header"); close(fd_bmp); return -1; }
+    if(header[0] != 'B' || header[1] != 'M'){ printf("not bmp\n"); close(fd_bmp); return -1; }
+
+    unsigned int img_w = le32(header + 18);   // 图片宽
+    unsigned int img_h = le32(header + 22);   // 图片高
+    unsigned int offset = le32(header + 10);  // 像素数据偏移
+    printf("bmp: %ux%u\n", img_w, img_h);
+
+    // 2.打开LCD + mmap（屏幕大小，用 lcd_into）
+    int fd_lcd = open(LCD_PATH, O_RDWR);
+    if(fd_lcd == -1){ perror("open lcd fail"); return -1; }
+
+    struct fb_var_screeninfo lcd_into;
+    if(ioctl(fd_lcd, FBIOGET_VSCREENINFO, &lcd_into) == -1){
+        perror("ioctl fail"); return -1;
+    }
+
+    int *lcd_p = mmap(NULL, lcd_into.xres * lcd_into.yres * 4,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, fd_lcd, 0);
+    if(lcd_p == MAP_FAILED){ perror("mmap fail"); return -1; }
+
+    // 3.按图片大小申请内存（不是屏幕大小！）
+    unsigned char *bmp_buf = (unsigned char *)malloc(img_w * img_h * 3);
+    int *lcd_buf = (int *)malloc(img_w * img_h * 4);
+    if(!bmp_buf || !lcd_buf){ printf("malloc fail\n"); return -1; }
+
+    // 跳到像素数据（用文件头的 offset，不写死 54）
+    lseek(fd_bmp, offset, SEEK_SET);
+    read(fd_bmp, bmp_buf, img_w * img_h * 3);
+
+    // 4.转换：循环用图片像素数
+    for(unsigned int i = 0; i < img_w * img_h; i++){
+        lcd_buf[i] = 0xFF000000u | bmp_buf[i*3] | bmp_buf[i*3+1] << 8 | bmp_buf[i*3+2] << 16;
+    }
+
+    // 5.倒序拷贝：源行按图片宽，目标行按屏幕宽
+    for(unsigned int y = 0; y < img_h && y < lcd_into.yres; y++){
+        memcpy(&lcd_p[y * lcd_into.xres],       // 屏幕第 y 行
+               &lcd_buf[(img_h - 1 - y) * img_w],  // 图片第 (img_h-1-y) 行
+               img_w * 4);                      // 一次拷图片的一整行
+    }
+
+    // 6.收尾
+    free(bmp_buf);
+    free(lcd_buf);
+    munmap(lcd_p, lcd_into.xres * lcd_into.yres * 4);
+    close(fd_lcd);
+    close(fd_bmp);
+    return 0;
+}
+```
+
+---
+
 # 系统 IO 学习笔记（2026-08-10）
 
 ## 一、两套 IO API（分清层级）
