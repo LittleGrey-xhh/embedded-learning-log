@@ -1,6 +1,561 @@
 # 嵌入式学习日记
 
-# 系统 IO 学习笔记（2026-08-13）
+# 8.18笔记：透明 gif 叠加进阶（背景跟随 + 移动反弹 + 四连坑）
+
+## 今日主线
+
+在 8.17 的透明 gif 基础上解决两大需求：
+1. **背景跟随**：界面程序切换页面后，gif 透明区域显示的新背景要跟着变（解决昨天遗留）
+2. **移动反弹**：gif 在屏幕上随机方向移动，碰边界反弹，移动中背景持续跟随
+
+过程像打地鼠：每解决一个问题就冒出下一个 bug，共踩了 4 个坑，最后收敛成一套完整的「移动精灵 + 动态界面叠加」方案。
+
+---
+
+## 一、需求 1：界面切换后，gif 背景跟随
+
+**干了什么**：透明 gif 叠在系统界面上（Qt 程序 iot 画的），之前 bg 是启动时抓一次的固定快照，界面切页面后背景不更新。
+
+### 关键认知：什么时候能"读"到干净界面？
+
+单层 framebuffer 下，gif 图案永远挡住它下方的界面，程序**平时读不到图案下面的界面**。唯一的干净窗口是：**界面程序全屏重绘的瞬间**——它会把我们的图案整个盖掉，那一刻 LCD 的 gif 区域是干净的新界面。
+
+### 智能重捕获原理
+
+```c
+// 每帧检测：LCD 的 gif 区域 ≠ 我上一帧提交的 canvas → 图案被界面盖掉了
+// → LCD 此刻是干净的新界面 → 重新捕获背景
+if (memcmp(lcd_gif区域, canvas, ...) != 0)
+    重新捕获 bg = LCD;
+```
+
+- 界面没动 → 图案还在 → LCD == canvas → 不触发，bg 保持有效
+- 界面切换 → 全屏重绘盖掉图案 → LCD ≠ canvas → 触发 → **捕获到干净新界面**
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 上次"方案没用" | 回退后功能根本没在代码里，或没重新编译。**先实测验证机制本身，别急着改方案** |
+| 误以为界面程序不在跑 | 界面程序是 `/IOT/iot`（Qt linuxfb 应用），进程名不含 qt/weston 等关键词，`ps | grep` 会漏。**先摸清环境再动手** |
+
+**验证手法**：写一个 `fill_rect` 工具往 gif 区域填纯色模拟界面重绘 → 跑程序观察日志和抓屏 → 中央从"蓝+图案"变"红+图案" = 重捕获生效。**模拟 + 抓屏 = 嵌入式调试三板斧**。
+
+---
+
+## 二、需求 2：gif 移动 + 反弹
+
+**干了什么**：gif 从屏幕中间出发，随机初始方向（4 个斜向）、固定速度，碰屏幕边界反弹。
+
+### 移动版的背景方案：整屏快照
+
+固定位置只存一块背景；移动时要**整屏界面快照 `bg_full`**（800x480 一份），gif 移到哪都能取对应位置的界面：
+
+```c
+// 每帧五步
+1. 移动 + 反弹（碰边翻转方向、位置钳到边界）
+2. 合成新位置 canvas = bg_full 新位置 + gif 图案
+3. 合成联合区域 bbox = "旧位置 ∪ 新位置"（填快照界面 + 贴 canvas）
+4. 一次性提交 bbox 到 LCD
+5. 界面快照同步（保持 bg_full 新鲜）
+```
+
+### 反弹逻辑
+
+```c
+gx += vx;  gy += vy;
+if (gx <= 0)            { gx = 0;         vx = -vx; }   // 碰左
+if (gx + sw >= xres)    { gx = xres - sw; vx = -vx; }   // 碰右
+if (gy <= 0)            { gy = 0;         vy = -vy; }   // 碰上
+if (gy + sh >= yres)    { gy = yres - sh; vy = -vy; }   // 碰下
+```
+
+---
+
+## 三、坑 1：动画频闪（先清后画）
+
+**现象**：gif 动起来背景一闪一闪。
+
+**根因**：写屏拆成两步「恢复旧位置 → 提交新位置」，两步之间有屏幕刷新（52Hz ≈ 19ms/次），看到"gif 消失"的中间态。
+
+**修复**：**联合区域 bbox 一次提交**——把"旧位置清除 + 新位置绘制"合并到同一个内存区域（bbox = 旧位置 ∪ 新位置），一次 memcpy 提交。屏幕看不到中间态。
+
+```c
+// bbox 合成：先填快照界面（同时清掉旧图案、铺好新位置界面）
+for (yy...) memcpy(bbox + yy*bw, bg_full + (by+yy)*xres + bx, bw*4);
+// 再贴 canvas 图案到新位置那块
+for (yy...) memcpy(bbox + (gy-by+yy)*bw + (gx-bx), canvas + yy*sw, sw*4);
+// 一次性提交
+for (yy...) memcpy(lcd_p + (by+yy)*xres + bx, bbox + yy*bw, bw*4);
+```
+
+> 核心原则：**所有耗时写屏操作统一"内存合成 → 一次性提交"**，屏幕只在提交瞬间变化。
+
+---
+
+## 四、坑 2：切换背景后，路径残留旧背景（概率性）
+
+**现象**：移动中切换页面，gif 走过的路径上概率性残留上一个页面。
+
+**根因**：**时序竞争**——iot 重绘新界面 → 我们用旧快照提交 bbox 覆盖了它 → 之后同步检测时 LCD 已是旧快照 → 误判"界面没变" → iot 的新界面永久丢失。
+
+```
+t0: iot 重绘 LCD = 新界面
+t1: 我们用【旧快照】提交 bbox → LCD 被覆盖回旧界面
+t2: 同步检测 LCD == 旧快照 → 不更新 → 新界面丢失
+```
+
+**修复**：同步**每帧执行、只扫 bbox、必须在提交之前**——界面程序的新内容此刻还在 LCD 上，先读进快照，合成 bbox 才不会覆盖它。残留窗口从"秒级"缩到"单帧内微秒级"。
+
+---
+
+## 五、坑 3：移动后一路拖影不消失
+
+**现象**：gif 移动留下整条拖影，永远不消失。
+
+**根因**：同步扫描 bbox 时，把**旧位置上的图案残留**（上一帧画的、本帧还没清）误判成"界面重绘"→ `bg_full 旧位置 = 图案`（快照被污染）→ bbox 填的旧位置是图案 → 拖影；且之后 LCD == 污染快照 → 检测不到 → **永久拖影**。
+
+**修复**：同步时区分两类区域：
+- **旧位置**（图案残留所在）→ 和 `canvas`（上一帧图案）比较：相等 = 图案还在，不动快照
+- **其余**（新位置独有 + 非图案区域）→ 和 `bg_full` 比较：不同 = 界面重绘
+
+```c
+if (in_prev) {
+    int ci = (ly - py) * sw + (lx - px);      // 旧位置 → canvas 比较
+    if (lcd[li] != canvas[ci]) bg[li] = lcd[li];
+} else {
+    if (lcd[li] != bg[li]) bg[li] = lcd[li];  // 其余 → 快照比较
+}
+```
+
+> 教训：**"读 LCD 判断界面是否重绘"必须排除"我们自己画的图案"**，否则图案残留会污染背景快照。
+
+---
+
+## 六、坑 4：路径上喷雾状颗粒 + 退出残留
+
+**现象**：移动路径及周围出现零散细小像素颗粒（像喷雾）；Ctrl+C 退出后屏幕不干净。
+
+**根因**：**数组越界读**！上一版 Sync 把"图案区域 = 新位置 ∪ 旧位置"统一用旧位置偏移索引 canvas：
+
+```c
+int ci = (ly - py) * sw + (lx - px);   // 新位置已移出旧位置！
+// lx - px 最大到 200+，canvas 宽只有 200 → 越界读到垃圾内存
+// → 与 LCD 比较必然不等 → bg_full 被随机污染 → 喷雾颗粒
+// → 退出恢复用的快照也是脏的 → 残留
+```
+
+**修复**：**只有旧位置才用 canvas 比较**（索引不越界）；新位置独有部分按普通界面处理（和 bg_full 比较）。
+
+> 教训：**移动精灵的内存索引，新旧位置的偏移必须分开算**。共用公式 = 越界 = 随机垃圾。
+
+---
+
+## 七、坑 5：Ctrl+C 退出残留最后一帧 gif
+
+**现象**：gif 移动后 Ctrl+C 退出，gif 实际所在位置残留最后一帧画面。
+
+**根因**：退出恢复函数用的是全局坐标 `g_x / g_y`——**只在启动时赋值一次，gif 移动后从不更新**！
+
+```c
+g_x = gx;  g_y = gy;      // 只在初始化时赋值（屏幕中间）
+signal(SIGINT, Cleanup_And_Exit);
+// gif 已经移到别处，但 g_x/g_y 永远是启动时的位置
+// → Ctrl+C 恢复的是"屏幕中间"那块，gif 真身残留
+```
+
+**修复**：主循环里每帧把当前位置同步给全局变量：
+
+```c
+// 循环内，每帧提交后
+g_x = gx;
+g_y = gy;
+// 退出时 Cleanup_And_Exit 就按当前位置恢复 bg_full
+```
+
+> 教训：**信号处理器里用的全局状态，必须在主循环里持续刷新**，不能只在初始化时赋值一次。
+
+---
+
+## 八、核心知识沉淀
+
+1. **单层 framebuffer 的透明叠加本质**：透明 = 不写 = 露出底层；程序只能依赖"界面重绘瞬间"读到干净界面
+2. **快照（bg_full）的正确维护**：`LCD != 快照` 才更新——但要排除自己的图案（旧位置用 canvas 比较）
+3. **双缓冲的正确用法**：耗时写屏全部走"内存合成 → 一次提交"；移动场景合成"旧 ∪ 新"联合区域
+4. **时序安全**：同步必须发生在提交之前，否则界面新内容被覆盖后永远读不回
+5. **全局状态的刷新**：信号处理器/回调用的全局变量，必须在主循环持续更新
+6. **嵌入式调试三板斧**：模拟（fill_rect 填色）→ 日志（printf 标记）→ 抓屏（dd fb0 转图片分析）
+
+## 九、踩坑速查表
+
+| # | 现象 | 根因 | 修复 |
+| :--- | :--- | :--- | :--- |
+| 1 | 动画频闪 | 写屏两步有空隙（先清后画） | bbox 联合区域一次提交 |
+| 2 | 切页后路径残留旧背景 | 时序竞争：旧快照提交覆盖新界面 | 每帧同步 + 提交前检测 |
+| 3 | 一路拖影不消失 | 图案残留误判为界面重绘 → 快照污染 | 旧位置用 canvas 比较，区分图案/非图案 |
+| 4 | 喷雾颗粒 | canvas 索引越界读垃圾内存 | 只有旧位置用 canvas 比较（索引安全） |
+| 5 | 退出残留最后一帧 | 退出恢复用的坐标只在启动时赋值，移动后不更新 | 主循环每帧同步当前位置到全局 |
+
+---
+
+# 8.17笔记：LCD 显示动图（JPEG 序列 + GIF 解码 + 透明叠加）
+
+## 一、LCD framebuffer 显示原理
+
+**干了什么**：理解屏幕怎么显示——LCD 就是 `/dev/fb0` 设备，映射成内存，写像素 = 显示颜色。
+
+```c
+int fd = open("/dev/fb0", O_RDWR);
+ioctl(fd, FBIOGET_VSCREENINFO, &lcd_info);   // 拿分辨率、色深
+int *lcd_p = mmap(NULL,
+                  lcd_info.xres * lcd_info.yres * lcd_info.bits_per_pixel / 8,
+                  PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+```
+
+### 像素寻址公式（核心）
+
+```c
+// 屏幕坐标 (x, y) 对应的内存位置：
+lcd_p[y * lcd_info.xres + x] = 颜色值;
+```
+
+- 行偏移 = `y * 屏幕宽` + `x`，**不是** `y * 屏幕高`
+- 32bpp 时每个像素是一个 `int`，颜色拼法：`R<<16 | G<<8 | B`
+
+### 颜色格式（32bpp ARGB8888）
+
+- 像素值：`0x00RRGGBB`（R 占 bit16-23，G bit8-15，B bit0-7）
+- 内存小端序：实际字节是 `BB GG RR 00`
+- 常用颜色：白 `0xFFFFFF`、黑 `0x000000`、蓝 `0xBA8B53`(83,139,186)
+
+### 三层 framebuffer（GEC6818 特性）
+
+`/dev/fb0` 虚拟分辨率 **800x1440 = 3 个 800x480 页**。显示哪页由 pan（yoffset）控制，当前显示 page0。三层设计本意是多图层叠加，但 nxp-fb 驱动只暴露标准 fbdev 接口，**没有公开的 alpha 混合/透明键接口**。
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 以为行偏移用 `y * yres` | 错！行偏移是 `y * xres`（每行的像素数） |
+
+---
+
+## 二、动图原理：视觉暂留
+
+**干了什么**：搞清楚动画为什么能动——人眼对画面有约 0.1s 残留，帧切换够快大脑就脑补成动画。
+
+| 参数 | 数值 |
+| :--- | :--- |
+| 帧间隔 | `usleep(30*1000)` = 30ms |
+| 帧率 | 1000/30 ≈ 33 帧/秒 |
+| 电影标准 | 24 帧/秒 |
+
+播放方式：
+1. **预拆帧序列**：动画拆成 N 张 JPEG 顺序显示（13.1）
+2. **直接解码 GIF**：giflib 解析 GIF 帧数据逐帧显示（13.2）
+
+### 帧序列循环：取模
+
+```c
+for (int i = 0; i < 80; i++)                         // 80 帧 = 播 10 轮
+    sprintf(path_name, "./gif3/Frame%d.jpg", i % 8); // i%8: 0~7 循环
+```
+
+`i % N` 让帧号到 N-1 后跳回 0。无限循环用 `while(1)`。
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 帧数变了（60→8）循环就乱 | 用 `i % 帧数` 取模，改帧数只改一个数 |
+
+---
+
+## 三、13.1：JPEG 帧序列播放（libjpeg）
+
+**干了什么**：用 libjpeg 解码 JPEG，任意尺寸任意位置显示到 LCD，循环播放帧序列。
+
+### libjpeg 解码标准流程
+
+```c
+struct jpeg_decompress_struct cinfo;
+struct jpeg_error_mgr jerr;
+cinfo.err = jpeg_std_error(&jerr);
+jpeg_create_decompress(&cinfo);        // 1. 创建解码对象
+jpeg_stdio_src(&cinfo, infile);        // 2. 绑定文件
+jpeg_read_header(&cinfo, TRUE);        // 3. 读头（拿宽高）
+jpeg_start_decompress(&cinfo);         // 4. 开始解压
+
+// 5. 逐行读像素（一行 = output_width 个像素 × 3 字节 RGB）
+unsigned char *buf = calloc(1, pic_w * 3);
+while (cinfo.output_scanline < cinfo.output_height)
+{
+    jpeg_read_scanlines(&cinfo, &buf, 1);   // 每读一次 scanline+1
+    lcd_p[...] = buf[3*i+0] << 16 | buf[3*i+1] << 8 | buf[3*i+2];
+}
+
+jpeg_finish_decompress(&cinfo);        // 6. 结束解压
+jpeg_destroy_decompress(&cinfo);       // 7. 释放对象
+```
+
+### 任意尺寸、任意位置的关键点
+
+1. **尺寸不写死**：用 `cinfo.output_width / output_height`，缓冲按 `pic_w * 3` 分配
+2. **任意位置**：目标行 `lcd_row = y + row`、目标列 `lcd_col = x + i`
+3. **越界裁剪**：行/列超出屏幕就跳过，防越界写内存
+
+```c
+int row = cinfo.output_scanline - 1;
+int lcd_row = y + row;
+if (lcd_row < 0 || lcd_row >= lcd_info.yres) continue;
+for (int i = 0; i < pic_w; i++)
+{
+    int lcd_col = x + i;
+    if (lcd_col < 0 || lcd_col >= lcd_info.xres) continue;
+    lcd_p[lcd_row * lcd_info.xres + lcd_col] = ...;
+}
+```
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 原函数写死 800 宽，换图花屏 | 尺寸从 `cinfo.output_width` 取，不写死 |
+| 图片比屏幕大，越界写内存 | 行列越界判断后再写 |
+| 编好的库（jpeg-10/.libs/libjpeg.a）在哪台机器 | 库用 `arm-linux-gcc` 交叉编译过，直接在编译命令里给 `.a` 全路径最稳 |
+
+---
+
+## 四、13.2：giflib 直接解码 GIF
+
+**干了什么**：不拆帧了，用 giflib 直接解析 .gif 文件，逐帧解码显示，还能读帧延迟、透明色。
+
+### GIF 文件结构
+
+```
+[GIF89a 头 6字节]
+[逻辑屏幕描述符]  ← 动画画布大小
+[全局色表]        ← 共用调色板（可选）
+┌─ 每帧 ─────────┐
+│ [GCE 图形控制扩展] ← 透明索引、帧延迟
+│ [图像描述符]      ← 帧尺寸/位置
+│ [局部色表]        ← 帧自己的调色板（可选）
+│ [像素数据]        ← LZW 压缩的色表索引
+└────────────────┘
+[0x3B 结束符]
+```
+
+### 关键概念 1：色表
+
+**GIF 像素存的是"色表索引"，不是 RGB！**
+
+```c
+unsigned char idx = RasterBits[位置];        // 拿到索引（如 42）
+GifColorType c = cmap->Colors[idx];          // 查色表拿真颜色
+lcd_p[位置] = c.Red << 16 | c.Green << 8 | c.Blue;
+```
+
+- 色表选择：**该帧有局部色表用局部**（`desc->ColorMap`），否则用全局（`gif->SColorMap`）
+- 查表 `idx % ColorCount` 取模防越界
+
+### 关键概念 2：GCE 图形控制扩展
+
+giflib 解析后 `ExtensionBlock.Bytes` 是 **4 字节**：
+
+```
+Bytes[0] = packed 标志位 (bit0 = 透明标志)
+Bytes[1] = 延迟低字节
+Bytes[2] = 延迟高字节
+Bytes[3] = 透明色索引
+```
+
+```c
+// 读透明索引
+if (Blocks[e].Function == GRAPHICS_EXT_FUNC_CODE &&   // 0xF9
+    Blocks[e].ByteCount >= 4)
+{
+    if (Blocks[e].Bytes[0] & 0x01)          // bit0 = 有透明
+        trans = Blocks[e].Bytes[3];         // 索引在 Bytes[3]
+}
+// 读帧延迟（单位 10ms）
+int delay = Blocks[e].Bytes[1] | (Blocks[e].Bytes[2] << 8);  // 小端
+delay_ms = delay * 10;
+```
+
+### 关键概念 3：透明语义
+
+```
+像素索引 == 透明索引  →  透明，不画，露出底层
+像素索引 != 透明索引  →  查色表，正常画
+```
+
+- **电脑播放器**：透明区域露出"画布"（棋盘格/网页底色）
+- **嵌入式 LCD**：没有画布概念，透明区域露出 framebuffer 旧内容（屏幕初始黑 → 显示黑）
+
+### 关键概念 4：interlace 隔行扫描
+
+隔行帧按 4 趟乱序存储，要先建行号映射表还原：
+
+```c
+趟1: 行 0,8,16... (步长8,起点0)   趟2: 行 4,12,20... (步长8,起点4)
+趟3: 行 2,6,10... (步长4,起点2)   趟4: 行 1,3,5...  (步长2,起点1)
+
+int pos = 0;
+for (int pass = 0; pass < 4; pass++) {
+    int start, step;
+    switch (pass) { case 0: start=0,step=8; case 1: start=4,step=8;
+                    case 2: start=2,step=4; default: start=1,step=2; }
+    for (int r = start; r < fh; r += step) row_map[pos++] = r;
+}
+// 画第 fy 行时，数据在 RasterBits 的 row_map[fy] 行
+```
+
+### giflib API
+
+```c
+int err = 0;
+GifFileType *gif = DGifOpenFileName(argv[1], &err);  // 打开
+DGifSlurp(gif);   // 一次性读入所有帧
+// gif->ImageCount 帧数, SWidth/SHeight 画布尺寸
+// 每帧: SavedImages[i].ImageDesc / RasterBits / ExtensionBlocks
+
+// 画帧循环
+while (1)
+    for (int f = 0; f < gif->ImageCount; f++)
+    {
+        画第 f 帧;
+        usleep(帧延迟(f) * 1000);
+    }
+```
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| `gif_lib.h` "无法打开" | 分清两种：VSCode 波浪线 = IntelliSense 配置（`c_cpp_properties.json` 加 includePath，用 WSL 内部路径 `/home/...`）；gcc 报错 = 真的找不到（查 `-I`） |
+| 库在 WSL、工具链在 VMware | 两个 Linux 路径不互通。要么同一环境装工具链，要么把库拷过去 |
+| `-lgif` 编译过但板子跑不起来 | 动态链接缺 `libgif.so`，嵌入式**直接给 `.a` 静态链接**最省事 |
+| ⭐ **GCE 解析偏移（今日最大坑）** | giflib 的 `Bytes` **剥掉了 size 和终止符**，只剩 4 字节；我按原始文件格式猜 `Bytes[4]` → 永远读不到 → 透明失效。**教训：用库前先写测试程序打印库内部结构，别按文件格式猜** |
+
+---
+
+## 五、透明叠加（画布管理）
+
+**干了什么**：透明 gif 叠在系统界面上，图案动、背景透出界面，无黑底无方框。
+
+### 核心思想
+
+透明 = "跳过不写" = 露出底层。播放前准备底层，每帧恢复底层再叠图案：
+
+```
+播放前：gif 区域的屏幕原画面 → 保存到 bg 数组
+每帧：  1. canvas = bg（恢复界面）
+        2. canvas 上画 gif 图案（透明像素跳过 → 保留界面）
+        3. 一次性提交 canvas 到 LCD
+```
+
+```c
+// 播放前保存背景
+int *bg = malloc(SW * SH * sizeof(int));
+for (int yy = 0; yy < SH; yy++)
+    memcpy(bg + yy*SW, lcd_p + (y+yy)*xres + x, SW * sizeof(int));
+```
+
+### 三种"透明"效果
+
+| 想要的效果 | 实现 |
+| :--- | :--- |
+| 透明 = 露出屏幕原画面 | 保存 bg + 透明跳过（画布管理） |
+| 透明 = 指定底色 | 播放前清屏 `for(i) lcd_p[i] = 0xFFFFFF` |
+| 透明 = 什么都不显示 | **物理上不可能**——LCD 每像素必须显示某种颜色 |
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 透明 gif 显示成黑底 | 透明判断失效（见四节 GCE 坑）→ 透明像素被画出来，而透明索引对应的色表颜色通常是黑色 |
+| 透明区域露"方框" | 不是 gif 的问题：屏幕残留了上次运行的画面，透明区域露的就是残留。**退出时把 bg 恢复回去，防止残影循环** |
+| 透明索引每帧不同 | ams1.gif 实测各帧 trans 不同（0/205~209），**必须按帧读 GCE**，不能只读第一帧 |
+| 界面切换后 gif 背景不刷新 | **未解决**：单层 framebuffer 下 gif 区域被图案占着，程序读不到下方界面（物理限制）；硬件三层 fb 驱动又无混合接口 |
+
+---
+
+## 六、双缓冲：消除动画撕裂
+
+**干了什么**：解决 gif 动起来时"背景图案偶尔闪现"。
+
+### 撕裂的成因
+
+屏幕持续刷新（52Hz ≈ 19ms 一次）。写入 LCD 耗时超过刷新周期：
+
+```
+恢复背景(写LCD) → 屏幕刷新(看到界面) → 画图案(写一半) → 屏幕刷新(半界面半图案) → 画完
+```
+
+人眼看到"半截界面 + 半截图案"= 撕裂 = 背景闪现。
+
+### 解法：内存合成 + 一次性提交
+
+**先在内存合成完整一帧，再一次性 memcpy 到 LCD**——屏幕只在提交瞬间变化，毫秒级完成，撕裂不可见。
+
+```c
+int *canvas = malloc(SW * SH * sizeof(int));      // 帧合成缓冲
+while (1)
+    for (int f = 0; f < gif->ImageCount; f++)
+    {
+        memcpy(canvas, bg, SW * SH * sizeof(int));     // 1. canvas = 界面
+        Show_Gif_Frame(gif, f, canvas, SW, 0, 0);      // 2. canvas 上画图案
+        for (int yy = 0; yy < SH; yy++)                // 3. 一次性提交 LCD
+            memcpy(lcd_p + (y+yy)*xres + x,
+                   canvas + yy*SW, SW * sizeof(int));
+        usleep(帧延迟 * 1000);
+    }
+```
+
+200x200x4 = 160KB，memcpy 毫秒级，远小于 19ms 刷新周期。
+
+### 配套：Show_Gif_Frame 的 pitch 参数
+
+函数既能画 LCD 也能画内存缓冲，靠 pitch（行宽）区分：
+
+```c
+Show_Gif_Frame(gif, f, lcd_p,  lcd_info.xres, x, y);  // 画 LCD：行宽 = xres
+Show_Gif_Frame(gif, f, canvas, gif->SWidth, 0, 0);    // 画 canvas：行宽 = gif 宽
+```
+
+### 踩的坑
+
+| 坑 | 结论 |
+| :--- | :--- |
+| 直接"恢复 bg + 逐像素画帧"会撕裂 | 所有耗时写入 LCD 的流程，统一走"内存合成 → 一次性 memcpy 提交" |
+| 画到 canvas 时行偏移算错 | 画到不同行宽的缓冲，函数要传 pitch（行宽），不能写死 xres |
+
+---
+
+## 七、交叉编译命令速查
+
+```bash
+# 13.1 JPEG：链接现成的 libjpeg.a
+arm-linux-gcc 13.1显示动图.c -I jpeg-10 jpeg-10/.libs/libjpeg.a -o 13.1_dongtu
+
+# 13.2 GIF：giflib 核心源文件直接一起编译（无需 make install）
+arm-linux-gcc 13.2显示gif.c \
+    ~/giflib-6.1.3/dgif_lib.c ~/giflib-6.1.3/gif_err.c \
+    ~/giflib-6.1.3/gifalloc.c ~/giflib-6.1.3/gif_hash.c \
+    ~/giflib-6.1.3/openbsd-reallocarray.c \
+    -I ~/giflib-6.1.3 -o 13.2_gif
+```
+
+| 链接方式 | 命令 | 板子上要带 |
+| :--- | :--- | :--- |
+| 静态 | 直接给 `.a` 路径 | 只要程序一个文件 |
+| 动态 | `-L 路径 -lgif` | 还要带 `libgif.so` |
+
+嵌入式板子上**优先静态链接**。
+
+---
+
+# 系统 IO 学习笔记（2026-0811~14）
 
 ## 一、LCD屏幕
 
