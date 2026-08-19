@@ -1,5 +1,141 @@
 # 嵌入式学习日记
 
+# 相册项目 v0.1 学习笔记（2026-08-19）
+
+## 一、今日主线
+
+把之前学的练习代码拼成一个真正的嵌入式工程：**简易相册 v0.1**，已在开发板跑通。
+
+- 核心转变：**带 `main()` 的练习程序 → 函数模块工程**（1 个 main + 4 个功能模块）
+- 关键技术点：模块化封装、交叉编译、framebuffer 显示、触控事件、libjpeg 解码、信号处理
+
+## 二、工程结构（模块划分）
+
+| 文件 | 模块 | 职责 | 原型练习 |
+|---|---|---|---|
+| `src/main.c` | 主程序 | 初始化 → 布局 → 首帧 → 事件循环 | 无（组装） |
+| `src/lcd.c` | LCD | init / clear / fill_rect / getter | 练习 9 |
+| `src/album.c` | 相册 | 扫描目录 + 按文件名排序 | 练习 12 |
+| `src/touch.c` | 触控 | 阻塞等一次点击，返回屏幕坐标 | 练习 14.3 |
+| `src/jpeg.c` | 图片 | libjpeg 解码 + 居中显示 | 练习 12.1 |
+| `inc/*.h` | 接口 | 每模块一个头文件，依赖显式化 | — |
+
+依赖关系（单向）：`touch/jpeg → lcd`，`main → 全部`，lcd 是底层谁都不依赖。
+
+## 三、程序完整流程
+
+```
+程序启动（板子上敲 ./photo_album）
+│
+├─ main()
+│  ├─【初始化①】lcd_init()          open /dev/fb0 + ioctl 拿分辨率 + mmap 显存
+│  ├─【初始化②】touch_init()        open /dev/input/event0 + 拿触控坐标范围
+│  ├─【初始化③】album_scan()        readdir 遍历 + 后缀匹配 + 冒泡排序
+│  ├─ signal(SIGINT, on_sigint)     注册 ctrl+c
+│  ├─【按钮布局】btn_left/btn_right  左右两侧垂直居中
+│  ├─【显示第一张】lcd_clear → show_jpeg(0) → draw_buttons
+│  └─【主循环】while(1)
+│       touch_wait_tap(&x,&y)      read 阻塞等触控
+│       → in_button 判定
+│         左按钮 → idx = (idx-1+n)%n
+│         右按钮 → idx = (idx+1)%n
+│         空白   → continue
+│       → lcd_clear → show_jpeg(idx) → draw_buttons → 回到等点击
+│
+├─ 用户按 ctrl+c
+│  └─ on_sigint()   lcd_clear() + _exit(0)（信号里只做异步安全的事）
+│
+└─ 程序结束
+```
+
+**show_jpeg(path) 内部**（解码 → 居中 → 写显存）：
+
+```
+fopen("rb") → 准备错误处理(setjmp/longjmp 安全网)
+→ jpeg_create_decompress → jpeg_stdio_src → jpeg_read_header
+→ jpeg_start_decompress（此刻宽高才有效）
+→ 算居中偏移 off_x=(xres-img_w)/2  off_y=(yres-img_h)/2
+→ 循环 jpeg_read_scanlines 一行行解码：
+    scr_y 越界 → 跳过（垂直裁剪）
+    逐像素：scr_x 越界 → 跳过（水平裁剪）
+    RGB 3 字节 → ARGB 4 字节：0xFF000000 | (r<<16) | (g<<8) | b
+    fb[scr_y*xres + scr_x] = 颜色
+→ jpeg_finish → jpeg_destroy → fclose
+```
+
+## 四、核心知识点（今天学到/巩固的）
+
+1. **模块化改造**：练习程序是"从 main 顺流而下"，工程是"main 调度各模块函数"。每个模块：内部 `static` 状态 + 对外一组函数（getter/init）。
+2. **指针输出参数**：`touch_wait_tap(&x, &y)` —— C 函数只能 return 一个值，要带出两个结果必须传地址，函数内 `*out_x` 和调用者 `x` 是同一块内存。`scanf` 的 `&` 是同一回事。
+3. **`const char *` 返回值**：album_get_path 返回只读字符串，外部想改直接编译报错——把"只读"写进类型里。
+4. **libjpeg 错误处理（setjmp/longjmp）**：libjpeg 默认出错 `exit()` 杀进程，mmap 的显存来不及清理。自定义 error_exit → longjmp 跳回 setjmp 处 → 自己清理后 return。相当于给解码铺安全网。
+5. **居中 = 偏移 + 裁剪（一个公式两种效果）**：`off = (屏幕 - 图片)/2`，图小 → 正偏移居中；图大 → 负偏移配合越界跳过 = 裁剪。
+6. **RGB → ARGB**：JPEG 输出 R,G,B（BMP 是 B,G,R 别搞混）；`0xFF000000` 不透明 alpha，`<<16/<<8` 把分量挪进高 24 位。
+7. **信号处理纪律**：`on_sigint` 里只做异步安全操作（清屏+_exit），不能 fopen/malloc/free（那些函数可能正处在半更新状态）。
+8. **嵌入式 UI 五段式骨架**：初始化 → 布局 → 首帧 → 事件循环 → 退出清理。以后所有嵌入式 UI 程序都套这个。
+
+## 五、v0.1 遗留问题（v0.2 待办）
+
+| 现象 | 原因分析 | v0.2 方案 |
+|---|---|---|
+| 大图只显示局部（没缩放） | show_jpeg 是"居中+裁剪"策略，不做缩放，图比屏大就裁掉 | libjpeg `scale_num/scale_denom` 缩放解码（1/2、1/4、1/8），或最邻近插值等比缩放 |
+| 切图能看到一行行加载 | 单缓冲：show_jpeg 逐行解码逐行写显存，写入过程直接可见 | 练习 10 的双缓冲：mmap 双倍显存 + `yoffset` 切换，先在后台画完再一次切换显示 |
+| ctrl+c 退出后黑屏，没恢复运行前画面 | on_sigint 里主动 `lcd_clear()` 清黑了 | 启动时 `memcpy` 备份显存，退出时恢复备份 |
+
+## 六、环境与部署备忘
+
+- **交叉工具链**：WSL `/home/xhh/toolchain/5.4.0/usr/bin/arm-linux-gcc`（buildroot 5.4.0），`~/.bashrc` 已配好，**直接 `make` 就行**
+- **libjpeg.a 位置坑**：真库在 `lib/jpeg-10/.libs/libjpeg.a`，顶层那个是 libtool 脚本不是库
+- **编译**：`cd v0.1 && make` → 产物 `bin/photo_album`（591K，ARM ELF，动态链接板子 glibc）
+- **部署**：`scp v0.1/bin/photo_album root@板子:/root/` + `scp pic/*.jpg root@板子:/root/pic/`
+- **运行**：`/root/photo_album`，ctrl+c 退出
+- **改配置**：图片目录在 `inc/album.h` 的 `ALBUM_DIR`；触控节点在 `src/touch.c` 的 `TOUCH_PATH`（默认 `/dev/input/event0`）
+
+## 七、v0.2 升级记录（晚场，板测发现问题 → 逐项解决）
+
+版本拆分：`v0.1` 稳定版（板子跑通基线，不再动），`v0.2` 开发版（新功能）。
+
+### 1. 双缓冲（解决切图"逐行加载"）
+
+- 原理（练习 10）：**mmap 双倍显存 + yoffset 切换可见区**
+- 画图永远画在"看不见的那块"（后台），画完 `lcd_flip()` 一次性切换 → 屏幕上看不到绘制过程
+- lcd 接口变化：`lcd_flip()`、`lcd_get_draw_fb()`（返回后台指针）、`lcd_clear_visible()`（清可见区，信号退出用）
+- main 切图四步：`lcd_clear()` 清后台 → `show_jpeg()` 画后台 → `draw_buttons()` 画后台 → `lcd_flip()` 切换
+
+### 2. 两级缩放（解决大图慢 + 显示不全）
+
+**第一级：libjpeg 缩放解码**（`scale_num / scale_denom`，支持 1/1、1/2、1/4、1/8）
+- 屏幕 800×480，相册图常是 2000~6000 像素巨图（最大 3200×6240 ≈ 2000 万像素）
+- 全尺寸解码 ARM 要 1~2 秒；缩 1/4 后解码量按面积降到 1/16
+
+**第二级：contain 等比适配 + 最邻近插值**（保证完整显示）
+- `scale = min(屏宽/图宽, 屏高/图高, 1.0)` → 宽高都不超屏，完整显示
+- 最邻近插值：目标像素 `(dx,dy)` 取源图 `(dx×源宽/目标宽, dy×源高/目标高)` 的像素
+- 比例不匹配时留黑边（竖图细长居中），这是"完整显示"的代价
+
+**踩过的坑：libjpeg 档位不能缩过头**
+- 原来档位用"OR（任一边放进屏幕就停）"→ 横图 1312×736 被缩到 656×368（已完全放进屏幕），contain 看到 src 不超屏 `scale=1` **不放大** → 四周黑边
+- 修复：档位判断改"**长边 ≥ 屏幕长边**"（找最大档，让下一档长边 < 屏就停），contain 接管另一边精确缩放
+- 经验：contain 不放大，所以 libjpeg 必须留至少一边超着，让 contain 有事可做
+
+### 3. 退出恢复画面（解决 ctrl+c 黑屏）
+
+- `lcd_backup()`：启动时（画任何东西之前）malloc 1.5MB 备份当前可见区（系统 console 画面）
+- `lcd_restore()`：退出时把备份写回可见区，屏幕恢复进入前的画面
+- 信号处理里只有 memcpy（纯内存操作），**异步安全**，可以放心在 on_sigint 里调
+
+### 4. 板子实测参数（SSH 查的）
+
+- `nxp-fb`：800×480，**虚拟分辨率 800,1440（3 块屏！）**，32bpp，stride 3200
+- 内存 807M，free 710M
+- `/root/pic` 20 张图全部超过屏幕（最大 3200×6240）
+
+### 5. v0.3 候选
+
+- **预解码缓存**：第三块屏（480 屏还没用）当缓存，后台提前解码下一张，点击零等待切换
+
+---
+
 # 8.18笔记：透明 gif 叠加进阶（背景跟随 + 移动反弹 + 四连坑）
 
 ## 今日主线
