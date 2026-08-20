@@ -1,5 +1,86 @@
 # 嵌入式学习日记
 
+# 学习笔记（2026-08-19）
+
+## 今日内容
+
+绝大数的硬件：字符设备文件
+
+存储设备：块设备文件
+
+后面要学的：
+LVGL：轻量化图形库 做界面，人机交互
+系统编程： 并发 + 进程间 通信
+网络编程： （不同主机通过网络）通信
+stm32，esp32
+
+## 复习：读取LCD触控屏坐标（input 子系统）
+
+一句话串起来：read 拿数据 → 按 type 分大类 → 按 code 分小类 → 存起来 → 等 SYN 句号 → 数据齐了再打印。读鼠标键盘（/dev/input/mouse0）同一套路。
+
+### input_event 结构（<linux/input.h>，固定 24 字节）
+
+time（时间戳） | type（大类） | code（小类） | value（数据）
+
+### 一次触摸 = 一串事件（顺序由驱动决定，不保证）
+
+ABS_X → ABS_Y → BTN_TOUCH → SYN_REPORT
+
+- EV_ABS(3) 坐标事件：code=ABS_X/ABS_Y 区分轴，value=坐标值（一次只带一个轴）
+- EV_KEY(1) 按键事件：code=BTN_TOUCH 触摸键，value=1 按下 / 0 抬起
+- EV_SYN(0) 帧结束标志（句号）：打印必须等它
+
+### 核心坑：时序
+
+驱动可能先报 BTN_TOUCH 再报坐标 → 在按键事件瞬间打印，x/y 还是上一次的残留值 → 位置错乱
+正确姿势：坐标事件只存、按键事件只记 pressed 状态、EV_SYN 才统一打印
+
+### read 返回值
+
+- 正数=实际字节数 / 0=末尾 / -1=出错（如 EINTR 被信号打断）
+- 必须判断 n != sizeof(ev) 丢弃残缺/脏数据
+- ssize_t = 带符号 long，专为 read 返回值设计；int 也行（这里读 24 字节够装）
+- 类型提升陷阱：int/ssize_t 与无符号 sizeof 比较时，-1 会被转成巨大无符号数
+  - n != sizeof(ev) 碰巧对（巨大数 != 24 成立）
+  - n <  sizeof(ev) 就错（巨大数 < 24 为假，残缺数据没被丢弃）→ bug 隐身
+  - 解法：强转无符号那方统一符号：(ssize_t)sizeof(ev) 或 (int)sizeof(ev)
+
+### ioctl 拿参数
+
+- FBIOGET_VSCREENINFO → LCD 分辨率 xres/yres
+- EVIOCGABS(ABS_X/ABS_Y) → 触摸原始坐标范围 minimum~maximum
+
+### 坐标换算（比例缩放）
+
+屏幕坐标 = 原始坐标 * 屏幕分辨率 / 触摸范围
+map_x(x, abs_x.maximum, scr.xres)
+
+### 坐标系校准（实测点四角）
+
+点左上角：打出 (0,0) 正常
+
+- 打出 (xres, 0) → X 轴镜像 → res-1-raw*res/max
+- 打出 (0, yres) → Y 轴镜像
+- 打出右下角 → X/Y 轴互换（map_x 用 abs_y 的数据）
+
+### stdout 缓冲（嵌入式调试常踩）
+
+- 行缓冲（目标=终端）：遇到 \n 就输出
+- 全缓冲（重定向/管道/ssh 远程）：攒够 4KB 或程序退出才输出 → 看起来"卡死"实际在跑
+- 解法：fflush(stdout) 立即刷出；stderr 无缓冲天然实时
+
+### close 规范
+
+- 死循环程序不 close 没事（进程退出内核自动回收 fd），但不是不 close 的理由
+- 规范：每条退出路径都 close；打开必配对关闭；错误分支也要关掉已打开的 fd
+
+### 其他
+
+- /dev/input/event* 节点号不固定，看 /proc/bus/input/devices 找带 BTN_TOUCH 的那个
+- 触摸屏 open 用 O_RDONLY 即可（只读设备别用 O_RDWR）
+
+---
+
 # 相册项目 v0.1 学习笔记（2026-08-19）
 
 ## 一、今日主线
