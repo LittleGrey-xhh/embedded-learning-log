@@ -1,6 +1,60 @@
 # 嵌入式学习日记
 
-# 学习笔记（2026-08-19）
+# 学习笔记（2026-08-25）
+
+## 干了什么
+
+LVGL 中文显示：TTF 字体转 LVGL 位图字体（lv_font_conv 在线转换器），把中文字体（阿里巴巴普惠体 ALBBttf18）应用到开发板界面。
+
+## 知识点
+
+1. 字体是"控件级"样式，不是全局的——每个要显示中文的控件都要单独设置字体：
+   ```c
+   extern lv_font_t ALBBttf18;   // 声明（变量名来自 .c 文件）
+   lv_obj_set_style_text_font(label, &ALBBttf18, LV_STATE_DEFAULT);
+   ```
+   默认字体 Montserrat 只有英文字母数字、没有中文字形 → 中文显示豆腐块。这就是"数字正常、中文方块"的根因。
+
+2. 字体源必须是中文字体——日文字体（如源柔ゴシック GenJyuuGothic）不含简体字，转换时"账/码/页/请/输"等纯简体字被静默丢弃。换阿里巴巴普惠体 / 微软雅黑 / 思源黑体。
+
+3. 字体只包含转换时勾选（--symbols）的字符——没勾的字显示空白/占位符。字符集要提前规划。
+
+4. BPP 决定抗锯齿：BPP 1 = 单色无平滑（边缘糙、省空间）；BPP 2/4 = 平滑（占用翻倍）。
+
+5. lv_font_conv 生成的 .c 文件头部注释有坑：注释里原样写入字符清单，若清单含 `*/`（如 `+-*/=`）会让 C 注释提前闭合 → 报 `stray '\200' in program`；注释里还可能混入 GBK 乱码。处理：直接删整个头部注释（纯信息无功能），`sed -i '1,63d' xxx.c`。
+
+6. lv_timer_create() 创建即生效，返回值只有在要 lv_timer_delete() / lv_timer_pause() 时才需要保存。
+
+## 踩的坑
+
+- extern 声明手滑带扩展名：`extern lv_font_t ALBBttf18.c;` 编译报错，正确是 `ALBBttf18`。
+- 中文显示不出来，按序查三件事：字体有没有套上（set_style_text_font）、字体源有没有这个字、源文件编码是不是 UTF-8。
+
+---
+
+# 学习笔记（2026-08-24）
+
+## 干了什么
+
+LVGL 工程构建与环境配置（PC 模拟器 + 开发板交叉编译环境搭建）。
+
+## 环境配置要点（简要）
+
+1. CMake 自动收集源文件：`file(GLOB CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.c")`——新建 .c 放 src/ 自动编译，不用改 CMakeLists。注意 GLOB 大小写敏感、不递归子目录。
+
+2. CMake 两阶段构建：`cmake -B build`（配置，生成 Makefile）→ `cmake --build build`（编译，等价 `make -C build`）。配置一次，之后只用 --build。
+
+3. lv_port_linux 只是"框架"（main.c / Makefile / lv_conf），lvgl 是独立仓库（github.com/lvgl/lvgl）。release 压缩包不带子模块内容，lvgl/ 目录是空的 → 必须自己放 lvgl 源码，否则直接 make 失败。
+
+4. WSL 的 venv 不能建在 /mnt/e（Windows 挂载盘 drvfs 不支持符号链接）→ build 目录必须放 Linux 盘，如 `-B /home/xhh/lvgl_build`。
+
+5. WSL 缺 python3.14-venv（ensurepip）→ LVGL 配置脚本要建 venv 装 pcpp，报错后 `sudo apt install python3.14-venv`。
+
+6. 旧交叉工具链（Buildroot 2016.11, gcc 5.4）缺 libmpfr.so.4 → cc1 起不来，`export LD_LIBRARY_PATH=/home/xhh/toolchain/5.4.0/usr/lib:$LD_LIBRARY_PATH`（已写入 ~/.bashrc）。
+
+---
+
+# 学习笔记（2026-08-20）
 
 ## 今日内容
 
