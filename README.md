@@ -1,5 +1,124 @@
 # 嵌入式学习日记
 
+# 学习笔记（2026-08-26）
+
+## 今日任务
+
+LVGL 中文输入全链路：自研拼音输入法（替代官方 lv_ime_pinyin）+ 软键盘封装 + 触摸屏驱动 + 中文字体排查（换黑体 simhei.ttf）+ 板子部署与出厂 iot 程序共存/退出恢复屏幕。
+
+---
+
+## 知识点
+
+### 一、输入法（自研方案）
+
+> 输入法是**自研的**：`pinyin_ime.c/h` 自含拼音字典（400+ 条目含"账号/密码/登录"等词组）+ 候选面板 + 翻页，封装成 `ime_box.c/h`（软键盘+拼音一体化）。官方 lv_ime_pinyin 存在（`src/widgets/ime/`，开关 `LV_USE_IME_PINYIN`），但内置字典只有约 2000 常用字且黑盒，自研版字典可控、全源码可读、学习价值高。
+
+1. **软键盘不弹（回调没注册）**
+   - 根因：`ta_event_cb` 定义了但**没有 `lv_obj_add_event_cb()` 注册到文本框**，点击永远不触发；且 screen 回调用 `LV_EVENT_ALL` 无条件隐藏键盘，任何事件都把它藏起来。
+   - 解决：注册回调（`LV_EVENT_ALL` 注册 + 内部过滤 `CLICKED/FOCUSED`）；screen 回调只响应 `LV_EVENT_CLICKED`。
+
+2. **中文前输入拼音不触发**
+   - 根因：拼音检测只看**文本末尾**（`pinyin_seg_start`），末尾是中文就不触发。
+   - 解决：改按**光标位置**检测——`pinyin_at_cursor()` 取光标前的连续小写字母段（`lv_textarea_get_cursor_pos` + UTF-8 字符索引转字节偏移）；候选替换也按光标位置（前缀 + 候选字 + 后缀，支持文本中间插入）。
+
+3. **点空白时候选面板残留**
+   - 根因：点空白只隐藏了键盘（screen_event_cb），没通知拼音模块隐藏候选面板。
+   - 解决：`pinyin_ime_hide_panel()` API，键盘收起时候选面板一起收。
+
+4. **键盘 √ 不自动关闭**
+   - 知识点：lv_keyboard 按确认键（√）会发 `LV_EVENT_READY` 事件。
+   - 解决：给 kb 注册 `LV_EVENT_READY` 回调 → 隐藏键盘 + 候选。
+
+### 二、触摸与硬件
+
+1. **点击输入框无反应 → 自写触摸驱动**
+   - 根因：配置 `LV_USE_EVDEV 0`（省 libevdev 依赖）+ 工具链/板子都没有 libevdev → LVGL 无输入设备。
+   - 解决：自写 `touch_input.c`，纯系统调用：
+     - `open("/dev/input/event0", O_RDONLY|O_NONBLOCK)`（板子触摸屏 gslX680）
+     - `ioctl EVIOCGABS` 动态读 ABS_X/Y 范围，线性映射到屏幕 800x480
+     - read 回调解析 `EV_ABS`(坐标) + `EV_KEY`(按下/松开)，填 `lv_indev_data_t`，注册 `LV_INDEV_TYPE_POINTER`
+   - 认知：触摸屏**内核驱动是板子自带的**（event0 是内核建好的），我们写的是 **LVGL 的输入适配层**（读内核事件翻译成 LVGL 点击），每个 GUI 框架都需要这层胶水。
+
+2. **点击"穿透"到下面内容 → 出厂 iot 程序抢设备**
+   - 根因：板子出厂 `./iot` 进程同时打开 `/dev/fb0`（渲染）和 `/dev/input/event0`（读触摸）；**Linux input 设备事件是广播给所有打开者的** → 点击同时触发 lvglsim 和 iot。
+   - 解决：`iot_ctl.c` 用 `killall -STOP/-CONT iot` 暂停/恢复（SIGSTOP 不杀进程，状态保留）。
+
+3. **退出画面残留 → 屏幕快照**
+   - 根因：程序退出后 fb0 无人清理/iot 重绘慢（一点点画）。
+   - 解决：`screen_snap.c`——启动时 `screen_snap_save()`（mmap 读 fb0 可见区存内存），退出时 `screen_snap_restore()`（一次性 memcpy 写回）再唤醒 iot，屏幕瞬间恢复原画面。
+
+### 三、核心知识沉淀
+
+1. **LVGL 事件是"命中分发"不是"广播认领"**：谁被点中谁收事件（坐标命中测试找唯一目标），事件不发父级（默认不冒泡，除非加 `LV_OBJ_FLAG_EVENT_BUBBLE`）。所以"点文本框弹键盘、点空白收键盘"两条事件流天然互不干扰。
+
+2. **弹出类 UI 万能模板**：创建对象（默认隐藏/待删）→ 写回调（`lv_event_get_code` 判断）→ `lv_obj_add_event_cb` 注册 → 回调里 `add/remove_flag(HIDDEN)` 或 `lv_obj_delete`。"点外面关闭" = 给遮罩/屏幕注册 CLICKED 回调，被点中即关闭。
+
+3. **"字库不全"有两层含义**：
+   - 拼音字典不全：候选面板出不来某些字（官方 lv_ime_pinyin 只有 ~2000 字）
+   - 字体文件缺字：候选/文本能插入但**渲染空白**（阿里巴巴普惠体精简版 3681 字，缺"哇" U+54C7）→ 用 fontTools `getBestCmap()` 验证字体是否含某字，换 simhei.ttf 黑体（28522 字全覆盖）
+
+4. **Linux input 事件广播给所有 reader**：多个程序同时 open 同一个 /dev/input/eventX 都会收到触摸 → 多 GUI 程序会互相"穿透"。独占输入需要先暂停/杀掉其他程序。
+
+---
+
+## 附：整体代码逻辑（Linux 工程）
+
+### 模块地图
+
+| 模块 | 职责 | 关键点 |
+|------|------|--------|
+| `main.c` | 程序入口 | 信号处理 + iot 管理 + 快照 + 主循环 |
+| `1.myUI.c` | 登录界面（myUI1） | 布局 + freetype 字体 + 接入输入法/触摸 |
+| `ime_box.c/h` | 软键盘+拼音一体化 | 点框弹键盘、点空白/√ 收起（含候选） |
+| `pinyin_ime.c/h` | 自研拼音输入法 | 字典、候选面板、翻页、光标检测 |
+| `popup.c/h` | 弹窗模块 | 普通弹窗 + 模态遮罩 |
+| `touch_input.c/h` | 触摸输入（读 event0） | open/read/ioctl，坐标映射 |
+| `iot_ctl.c/h` | 暂停/恢复出厂 iot | SIGSTOP/SIGCONT |
+| `screen_snap.c/h` | 屏幕快照 | 启动保存 fb0，退出写回 |
+| freetype + simhei.ttf | 动态中文字体渲染 | `__linux__` 宏切路径 |
+
+### 程序生命周期
+
+```
+main() 启动
+ ├─ 注册 SIGINT/SIGTERM → on_exit_signal（退出时恢复 iot + 快照）
+ ├─ screen_snap_save()   保存当前屏幕（iot 界面）到内存
+ ├─ iot_pause()          SIGSTOP 暂停 iot，屏幕/触摸独占
+ ├─ lv_init()            LVGL 初始化
+ ├─ driver_backends_init 初始化 fbdev 显示后端
+ ├─ myUI1()              创建登录界面
+ │   ├─ fb_clear()       清屏
+ │   ├─ touch_input_init() 注册触摸 indev（读 /dev/input/event0）
+ │   ├─ 创建背景/输入框/按钮/标题
+ │   ├─ lv_freetype_font_create("/root/simhei.ttf")  动态字体
+ │   │   └─ 失败 → 回退内置思源黑体
+ │   ├─ ime_box_init()   建软键盘 + 拼音候选面板
+ │   └─ ime_box_bind_textarea_pinyin(账号框) / bind(密码框)
+ └─ driver_backends_run_loop()  主循环（lv_timer_handler 驱动）
+
+交互链路（点屏幕 → 出中文）：
+ 触摸屏 → touch_input read_cb 解析 EV_ABS/EV_KEY
+  → LVGL POINTER indev → 命中测试 → 事件发给被点中的对象
+  → 点输入框 → ta_event_cb → 键盘弹出 + lv_keyboard_set_textarea 绑定
+  → 按键 → textarea VALUE_CHANGED → pinyin_at_cursor(光标前拼音)
+  → 查字典前缀匹配 → 候选面板显示（翻页）
+  → 点候选 → 光标处替换拼音段为中文 → 插入完成
+  → 点空白/√ → 键盘 + 候选面板一起收起
+
+退出流程：
+ Ctrl+C → on_exit_signal
+  → screen_snap_restore()  一次性写回保存的 iot 画面
+  → iot_resume()           SIGCONT 唤醒 iot
+  → _exit(0)
+```
+
+### 一条完整链路示例
+
+点账号框输入"账号"：触摸 event0 → touch read_cb（坐标映射 800x480）→ LVGL 命中 textarea1 → CLICKED → ime_box 弹键盘 → 打 `zhanghu` → VALUE_CHANGED → 光标前取拼音 → 字典前缀匹配"帐 账 胀…账号" → 候选面板 → 点"账号" → 光标处替换 → textarea 显示"账号"（freetype 渲染黑体）→ 点空白 → 键盘+候选收起。
+
+---
+
 # 学习笔记（2026-08-25）
 
 ## 干了什么
