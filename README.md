@@ -1,5 +1,100 @@
 # 嵌入式学习日记
 
+# 学习笔记（2026-08-27）
+
+## 今日任务
+
+把 C 控制台航班系统（project1）改造成 LVGL 图形界面（LVGL 9.5.0 / SDL 800x480 / CMake+Ninja+mingw64）：
+分层架构（UI 层 → biz 接口层 → .dat 数据层）→ 10 个页面全实现 → biz 层接真实 .dat 持久化 → 权限修复 → 补全功能（修改航班/编辑用户）→  UI 美化
+
+---
+
+## 知识点
+
+1. **屏幕切换（LVGL v9）**
+   - 建屏用 `lv_obj_create(NULL)`；切屏用 `lv_screen_load_anim(scr, 动画, 时长, 延迟, auto_del)`；v8 的 `lv_scr_load*` 靠 `lv_api_map_v8.h` 兼容宏续命，能跑但应改成 v9 命名。
+   - 页面生命周期模板：每屏 `xxx_init()` 建一次对象（存全局指针），`xxx_show()` 懒加载切屏（`if(scr==NULL) init();` + `lv_screen_load_anim`）。注意 `lv_screen_load_anim` 必须放在 if 外，否则屏已存在时切不回去（登出 bug 的根因）。
+
+2. **按钮回调区分：user_data 传 int 动作码**
+   - 多个按钮共用一个回调时，创建时 `lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void*)(intptr_t)动作码)`，回调里 `lv_event_get_user_data(e)` 取出 switch 分发。宫格循环建按钮也能精确区分。
+
+3. **LVGL 事件顺序（重要）**
+   - 顺序是：1) preprocess 用户回调（`LV_EVENT_PREPROCESS` 标志）→ 2) class event_cb（控件自身绘制）→ 3) 普通用户回调。
+   - 想在控件绘制**前**插画背景必须注册 `LV_EVENT_XXX | LV_EVENT_PREPROCESS`；想在绘制**后**处理用普通回调。搞反了就是"背景盖住文字"或"高亮被底板盖住"。
+
+4. **lv_table 表格机制（踩坑最多）**
+   - cell_state 只继承 PRESSED/FOCUSED/EDITED，**没有持久选中态** → `LV_PART_ITEMS | LV_STATE_CHECKED` 样式永远不会生效。
+   - 但**逻辑选中一直有效**：点击更新内部 row_act/col_act → 触发 `LV_EVENT_VALUE_CHANGED`，选中数据改权限走的就是这条路径。缺的只是视觉。
+   - cell 文字色必须用 **`LV_PART_ITEMS`** 的 selector 设置，`LV_STATE_DEFAULT`（默认 PART_MAIN）对 cell 无效——这是"文字消失"的坑。
+   - obj 处于 `LV_STATE_FOCUSED` 时，选中 cell 会应用 `LV_PART_ITEMS | LV_STATE_FOCUSED` 样式（仅 1 格），可用来做选中格变色。
+   - 内部精确行高在 `lvgl/src/widgets/table/lv_table_private.h` 的 `row_h[]`（含折行 cell 的真实高度），include private 头直接累加比公式估算可靠。
+
+5. **整行选中高亮正解：高亮条 = 表格的子对象**
+   - 别跟绘制事件较劲（自绘要处理屏幕坐标、滚动偏移、行高、事件顺序、底板遮挡，连环坑）。正确做法：`lv_obj_create(table)` 建一个半透明浅蓝条，选中时叠在对应行上：
+     - 子对象坐标随表格内容自动滚动、超出区域自动裁剪——滚动跟随零成本
+     - 不设 CLICKABLE → 点击穿透到表格
+     - 指针管理：table.user_data = 高亮条，高亮条.user_data = 选中行号
+     - 表格本身恢复白底黑字（MAIN 白底不透明 + ITEMS 黑字），外观正常
+   - 退出页面/刷新数据时记得清选中（`ui_table_update_sel(table, 0)`），否则残留。
+
+6. **lv_dropdown 下拉框**
+   - 默认箭头符号（LV_SYMBOL_DOWN）若字体缺字形会显示成**方框**，用 `lv_dropdown_set_symbol(dd, NULL)` 去掉。
+   - **必须传 NULL，不能传 `""`**——空串在绘制时被 `lv_image_src_get_type("")` 当图片源解析 → 程序崩溃闪退。
+
+7. **字体**
+   - 中文字体用 freetype 动态加载（`lv_freetype_font_create`），做成单例懒加载（`app_get_font()` 只建一次），所有页面共用；创建失败回退内置思源黑体。
+   - lv_table / lv_dropdown 列表必须显式设字体，否则中文豆腐块。
+   - 自定义字体缺字形（如 ¥、箭头）时显示方框，要么换字体要么去掉该字符。
+
+8. **分层架构 + .dat 持久化**
+   - UI 层（页面 .c）只画界面、收输入、调接口；biz 接口层暴露全部业务函数（登录/下单/取消/增删改查），接口签名稳定 → 未来换真实逻辑 UI 零改动。
+   - biz 层懒加载：首次调用任一接口 `ensure_loaded()` 自动读盘，文件不存在用种子数据写盘；增删改即时 `save_to_file()`。
+   - Windows 下建目录用 `_mkdir`（需 `#include <direct.h>`，mingw 否则隐式声明告警）；加载时从订单号恢复自增基数（O%05d），重启不重复。
+   - data/ 生成在**程序工作目录**下（相对路径），biz 懒加载 → 只停在登录界面不会生成数据文件。
+
+9. **软键盘（ime_box）**
+   - 键盘挂 `lv_layer_top()` 顶层图层，任何页面点输入框都能弹；切屏/弹窗前统一 `ime_box_hide()` 防残留。
+   - 表单控件放 y < 288（键盘从 y=288 弹出，pct40 高），否则被键盘挡住/重叠。
+
+---
+
+## 踩的坑
+
+1. **`lv_dropdown_set_symbol(dd, "")` 闪退**：空串被 `lv_image_src_get_type` 当图片源解码 → 崩。传 NULL。
+2. **自绘高亮连环坑（最终放弃）**：
+   - 本地坐标 vs lv_table 的屏幕坐标（obj->coords + scroll_y）→ 位置错位
+   - 行高公式估算 vs 内部 row_h（身份证 18 位折行后行高变大）→ 点第 3 行画到第 1 行
+   - 事件顺序搞反（普通回调在 class 绘制后）→ 背景盖住文字
+   - preprocess 画在底层，被 MAIN 底板背景盖住 → 高亮消失
+   - MAIN 设透明后主题把 cell 文字自动判成深色 → 选中前文字全消失
+   - 结论：**自绘表格高亮 = 和 LVGL 绘制管线作对，子对象方案一劳永逸**
+3. **orders.dat 只有 7 字段**（project1 漏存 userId）：迁移时按 8 字段完整落盘（订单号|用户|航班|乘客|身份证|数量|总价|状态），顺带修复归属查询。
+4. **popup 重复挂回调**：每次弹窗给 parent 加同名回调会累积（点击一次触发多次），先 `lv_obj_remove_event_cb` 再挂。
+5. **链接 Permission denied**：main.exe 被正在运行的程序占用，关掉再编译。
+6. **FOCUSED 白字只作用于选中的 1 个 cell**，整行文字变色做不到——放弃该需求，用"半透明蓝盖黑字变深蓝"替代。
+7. **函数改名没改全**：switch_panel 形参 to_add 改 to_form 后函数体残留旧名引用 → 编译报错。改名要全文检查。
+
+---
+
+## 附：工程架构
+
+```
+UI 层（src/*.c 页面，10 个）
+ ├─ login / register / forget_pwd     登录三件套
+ ├─ menu                              主菜单（宫格，管理员按钮显隐）
+ ├─ flight_query / book_ticket / my_order   普通用户功能
+ ├─ flight_manage / user_manage / data_overview   管理员功能
+ └─ ui_common（字体单例 + 统一头栏 + 整行高亮工具）
+biz 接口层（src/biz_*.c）
+ ├─ biz_user   登录/注册/重置/删除/角色/编辑  → data/users.dat（4 字段）
+ ├─ biz_flight 查询/增删改/扣票回补           → data/flights.dat（9 字段）
+ └─ biz_order  下单/取消/按用户查             → data/orders.dat（8 字段）
+```
+
+编译：`"D:/CLion 2023.2.2/bin/ninja/win/x64/ninja.exe" -C build`（cmake 不在 PATH；gcc 在 E:/mingw64）
+测试账号：`root/admin123`（管理员）、`test1/111111`（普通）
+
+
 # 学习笔记（2026-08-26）
 
 ## 今日任务
