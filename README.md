@@ -1,5 +1,40 @@
 # 嵌入式学习日记
 
+# 学习笔记（2026-08-28）
+
+## 今日任务
+
+把 LVGL 航班系统（Windows 模拟器版）移植到 GEC6818 开发板（lv_port_linux v9.5 + fbdev + arm-linux-gcc 5.4.0），交叉编译、SSH 部署、实机调试。排查并修复"菜单第一行按钮（查询航班/订票）点击无反应"问题——根因是触摸屏 y 向非线性。
+
+---
+
+## 知识点
+
+1. **LVGL 触摸屏非线性校准**
+   - 触摸屏坐标映射不能想当然线性。
+   - 调试"点不到按钮"时，用"按钮内部位置（LVGL）vs 触摸报告坐标 vs 抓屏渲染位置"三路对账定位。
+   - gslX680 这类带虚拟屏幕的屏常见 y 向非线性，用分段校准表（实测点插值）修复。
+
+---
+
+## 踩的坑
+
+1. **触摸屏 y 向非线性导致按钮点不中**：第一行按钮（屏幕 y≈100）触摸报告 y=62，偏上 38px 直接点空；第二行（y≈186）只偏 5px 仍在按钮内所以正常。用实测点建分段校准表 `{(0,0),(78,100),(227,186),(337,268),(475,365),(600,480)}` 插值修复。
+2. **stdout 块缓冲吞日志**：nohup 重定向运行时 printf 被缓冲，程序崩溃/被杀时日志丢失。调试期 `setvbuf(stdout, NULL, _IONBF, 0)` 关缓冲。
+3. **BusyBox 板子无 sftp-server**：paramiko `open_sftp()` 报 EOF，用 `exec_command("cat > 文件")` + stdin 流式写上传兜底。
+4. **交叉编译 cc1 依赖 libmpfr.so.4**：工具链需 `export LD_LIBRARY_PATH=/home/xhh/toolchain/5.4.0/usr/lib`，否则编译报错。
+
+---
+
+## 附：开发板部署备忘
+
+- 板子 IP：192.168.172.84（root/123456）
+- 程序路径：/root/lvgl/lvglsim（主人习惯跑这个）
+- 部署脚本：deploy/board_deploy.py（paramiko，probe/scp/run/fetch 四模式）
+- 编译：`cd /home/xhh/lvgl_build && export PATH=/home/xhh/toolchain/5.4.0/usr/bin:$PATH && export LD_LIBRARY_PATH=/home/xhh/toolchain/5.4.0/usr/lib:$LD_LIBRARY_PATH && cmake --build . -j4`
+
+---
+
 # 学习笔记（2026-08-27）
 
 ## 今日任务
@@ -94,6 +129,7 @@ biz 接口层（src/biz_*.c）
 编译：`"D:/CLion 2023.2.2/bin/ninja/win/x64/ninja.exe" -C build`（cmake 不在 PATH；gcc 在 E:/mingw64）
 测试账号：`root/admin123`（管理员）、`test1/111111`（普通）
 
+---
 
 # 学习笔记（2026-08-26）
 
@@ -1568,8 +1604,8 @@ snprintf(msg, sizeof(msg), "Score: %d", 95);
 
 ### 踩过的坑
 
-- **直觉误区**：想当然地认为 `Pop` 只需要返回成功/失败，导致栈顶数据永久丢失，无法使用弹出的值。  
-- **语法困惑**：看到 `*out_val = tmp->data` 时，不明白为什么要对 `out_val` 解引用，误以为直接写 `out_val = tmp->data` 就能把数据传出去。  
+- **直觉误区**：想当然地认为 `Pop` 只需要返回成功/失败，导致栈顶数据永久丢失，无法使用弹出的值。
+- **语法困惑**：看到 `*out_val = tmp->data` 时，不明白为什么要对 `out_val` 解引用，误以为直接写 `out_val = tmp->data` 就能把数据传出去。
 - **空指针忽略**：起初没想过调用者可能不需要数据而传 `NULL`，若不加判断就解引用会导致程序崩溃；是在讨论防御性编程时才意识到这个隐患。
 
 ### 正确做法
@@ -1736,15 +1772,15 @@ bool CircularLinkedList_HeadDelete(Manager_t *manager){
     if(manager->first == NULL){
         printf("链表为空，无法删除\n");
         return false;
-    }    
-    
+    }
+
     // 1.定义一个临时变量来存放首节点的地址
-    Node_t *tmp = manager->first;    
-    
+    Node_t *tmp = manager->first;
+
     // 2.将首节点的下一个节点作为新的首节点
     manager->first = manager->first->next;
 
-    
+
     // 3.释放掉原来的首节点
     if(manager->first == NULL){
         // 删除后如果链表为空，必须把尾指针也置空
@@ -1753,14 +1789,14 @@ bool CircularLinkedList_HeadDelete(Manager_t *manager){
     else{
         // 删除后如果链表不为空，必须将尾节点的next指向新的首节点
         manager->tail->next = manager->first;
-    }    
+    }
     free(tmp);
-    tmp = NULL;    
-    
-    // 4.链表节点数减1
-    manager->num -= 1;  
+    tmp = NULL;
 
-    
+    // 4.链表节点数减1
+    manager->num -= 1;
+
+
     return true;
 }
 ```
@@ -1769,8 +1805,8 @@ bool CircularLinkedList_HeadDelete(Manager_t *manager){
 
 这会导致：
 
-1. **`manager->first == NULL` 这个分支永远不会执行**。  
-2. 程序会错误地走入 `else` 分支，执行 `manager->tail->next = manager->first`，而此时那个唯一的节点已经被 `free` 了，**访问已释放内存**，未定义行为（崩溃或逻辑错乱）。  
+1. **`manager->first == NULL` 这个分支永远不会执行**。
+2. 程序会错误地走入 `else` 分支，执行 `manager->tail->next = manager->first`，而此时那个唯一的节点已经被 `free` 了，**访问已释放内存**，未定义行为（崩溃或逻辑错乱）。
 3. 删完后 `first` 和 `tail` 都还指向已释放的节点，成为悬挂指针。
 
 ---
@@ -1998,11 +2034,11 @@ SequenceList_Destory(list);
 // 此时 list 仍然保存着原来的地址值（野指针）
 ```
 
-**原理：**  
-函数参数 `manager` 是 `list` 的一个**副本**。  
-你把 `list` 的值（某内存地址 0x1000）传进去，`manager` 也变成了 0x1000。  
-函数内部 `free(manager)` 只释放了 0x1000 处的内存，但 `manager` 这个局部变量本身和外面的 `list` 是**独立的两个变量**。  
-函数结束时 `manager` 被销毁，但 `list` 的值依然是 0x1000，就成了野指针。  
+**原理：**
+函数参数 `manager` 是 `list` 的一个**副本**。
+你把 `list` 的值（某内存地址 0x1000）传进去，`manager` 也变成了 0x1000。
+函数内部 `free(manager)` 只释放了 0x1000 处的内存，但 `manager` 这个局部变量本身和外面的 `list` 是**独立的两个变量**。
+函数结束时 `manager` 被销毁，但 `list` 的值依然是 0x1000，就成了野指针。
 所以**必须手动** `list = NULL`。
 
 ---
@@ -2026,10 +2062,10 @@ SequenceList_Destory(&list);
 // 此时 list 自动变成 NULL
 ```
 
-**原理：**  
-这次传的不是 `list` 的值，而是 **`list` 自己的地址**（`&list`）。  
-函数内部 `*pp_manager` 就是 **外面的 `list` 本身**。  
-所以 `*pp_manager = NULL` 这句话，直接修改了外部 `list` 的值。  
+**原理：**
+这次传的不是 `list` 的值，而是 **`list` 自己的地址**（`&list`）。
+函数内部 `*pp_manager` 就是 **外面的 `list` 本身**。
+所以 `*pp_manager = NULL` 这句话，直接修改了外部 `list` 的值。
 函数结束后，`list` 就已经是 `NULL` 了，不需要再手动置空。
 
 ---
@@ -2045,10 +2081,10 @@ SequenceList_Destory(&list);
 
 ### 4. 简单总结
 
-- 想改外部的 `int`，需要传 `int *`。  
+- 想改外部的 `int`，需要传 `int *`。
 - 想改外部的 `SList_t *`（即修改指针本身），需要传 `SList_t **`。
 
-所以使用二级指针的销毁函数更“省心”，一次调用彻底安全；  
+所以使用二级指针的销毁函数更“省心”，一次调用彻底安全；
 用一级指针的版本则是“用完自己记得打扫”，需要手动 `list = NULL`，但代码看着更简洁。
 
 ---
@@ -2072,8 +2108,8 @@ void SequenceList_Destory(SList_t *manager)
 }
 ```
 
-这里的 `manager` 是 `SList_t *` 类型，`*manager` 就是 **一个 `SList_t` 结构体**。  
-`NULL` 是指针类型的空值（通常定义为 `(void*)0`），**不能赋值给结构体变量**。  
+这里的 `manager` 是 `SList_t *` 类型，`*manager` 就是 **一个 `SList_t` 结构体**。
+`NULL` 是指针类型的空值（通常定义为 `(void*)0`），**不能赋值给结构体变量**。
 编译器会直接报错：
 
 ```text
@@ -2356,9 +2392,9 @@ static 内存对齐 结构体赋值 指针数组 数组指针 strcpy sizeof mall
 - 可移植代码中，字符串长度应使用 `strlen`，内存大小应使用 `sizeof`，不要混用。
 
 ### 踩过的坑
-- **错误直觉**：认为 `char *arr = "abcde abcde"; int len = sizeof(arr)/sizeof(arr[0]);` 能像数组一样得到字符串长度（比如 11）。  
+- **错误直觉**：认为 `char *arr = "abcde abcde"; int len = sizeof(arr)/sizeof(arr[0]);` 能像数组一样得到字符串长度（比如 11）。
   **实际发生**：`sizeof(arr)` 拿到的是指针变量自身大小（我机器上是 8），除以 `sizeof(arr[0])`（即 `sizeof(char)`，值为 1），结果永远是 8 或 4，根本不是字符串长度。
-- **错误直觉**：以为 `sizeof(char) == 1` 是因为一个 char 就是 8 位、1 字节固定为 8 位。  
+- **错误直觉**：以为 `sizeof(char) == 1` 是因为一个 char 就是 8 位、1 字节固定为 8 位。
   **实际发生**：C 语言的"字节"是以 `char` 的大小定义的，如果平台上的 `char` 是 16 位，那么 1 字节就是 16 位；`sizeof(char)` 恒为 1 是因为它本身就是度量其他类型的尺子，与具体多少位无关。
 
 ### 正确做法
