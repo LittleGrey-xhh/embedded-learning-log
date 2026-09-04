@@ -7,6 +7,94 @@
 
 ---
 
+# 9.4 笔记：线程的创建与退出（pthread_create / pthread_exit / pthread_join）
+
+线程是系统调度资源的最小单位
+
+进程是系统分配资源的最小单位
+
+---
+
+## 总结
+
+- **wait()**：是**进程**的收尸工具。父进程等子进程退出，回收的是僵尸进程的 PCB 和退出码。
+- **pthread_join()**：是**线程**的收尸工具。等同进程内的某条线程结束，回收它的栈资源 + `void*` 返回值。
+- 两者道理相同：**退出后的残余必须有人来收**，进程不收就变僵尸，joinable 线程不被 join 栈就不释放——"线程级僵尸"。
+
+---
+
+### 详细对比表（背下这 4 点就够了）
+
+| 对比维度 | **wait() (进程)** | **pthread_join() (线程)** |
+| :--- | :--- | :--- |
+| **1. 作用对象** | 子进程（默认等**任意**一个，waitpid 才能指定） | 同进程内**指定的那条**线程（必须传 tid） |
+| **2. 回收什么** | 僵尸进程的 PCB、退出码 | 线程的栈空间、退出状态（`void*` 返回值） |
+| **3. 产出形式** | `status`（要用 `WEXITSTATUS` 宏解析） | `retval`（直接拿到 `pthread_exit` 传的指针） |
+| **4. 不收的后果** | 子进程变僵尸，占 PID 和进程表项 | joinable 线程的栈资源不释放 |
+
+---
+
+### 主线程"退出但不杀进程"
+
+1. 执行 `main()` 的线程**本身就是主线程**，不用单独写"主线程函数"。
+2. `main` 里 `return 0` = **整个进程结束**，所有线程陪葬。
+3. 主线程想先走但让子线程活着，必须调 `pthread_exit(&val)`——只终止主线程，进程等最后一条线程退出才结束。
+
+---
+
+### 线程间传数据的两条通道（互不干扰）
+
+1. **创建时传参通道**：`pthread_create` 第 4 参数传"变量的**地址**"（如 `&main_tid`），子线程用形参 `void *arg` 接住，按约定类型解引用还原：`*(pthread_t *)arg`。
+2. **返回值通道**：主线程 `pthread_exit(&exit_val)` 把值挂在退出状态上 → 子线程 `pthread_join(main_tid, &retval)` 的**第 2 个参数**接回来。
+3. `pthread_self()` 在 `main` 里调用，拿到的就是主线程自己的 tid，配合通道 1 传给子线程供它 join。
+
+**代码模板**：
+
+```c
+void *task_fun(void *arg){
+    pthread_t main_tid = *(pthread_t *)arg;   // 解引用还原 tid
+    void *retval = NULL;
+    pthread_join(main_tid, &retval);          // 接合主线程
+    printf("主线程的退出值为%d\n", *(int *)retval);
+    pthread_exit(NULL);
+}
+
+int main(){
+    pthread_t thread_1;
+    pthread_t main_tid = pthread_self();
+    pthread_create(&thread_1, NULL, task_fun, &main_tid);  // 传地址！
+
+    static int i = 0;   // 必须 static：主线程退出后栈失效
+    while(i < 3){ i++; sleep(1); }
+    pthread_exit(&i);   // 不是 return！
+}
+```
+
+---
+
+## 踩坑
+
+1. **线程函数返回类型少写 `*`**：写成 `void task_fun(void *)`，`pthread_create` 第 3 参类型不匹配，报 `argument 3 from incompatible pointer type`。必须是 `void *task_fun(void *)`。
+2. **第 4 参数硬传 `(void *)main_tid`**：tid 本质是整数（unsigned long），强转成指针是把整数伪装成地址，子线程一解引用就段错误。规矩：**想传谁的值就传谁的地址**，传值和解引用两头必须配套。
+3. **返回值变量必须 static 或全局**：主线程退出后其栈失效，传局部变量地址是悬空指针，子线程 join 拿到的值不可靠。
+
+---
+
+## 易混淆
+
+| 对比维度 | `return`（main 里） | `pthread_exit()`（main 里） |
+| :--- | :--- | :--- |
+| **终止范围** | 整个进程，所有线程陪葬 | 只有主线程自己 |
+| **使用场景** | 真的要结束程序 | 主线程先退，把舞台留给子线程 |
+
+| 对比维度 | joinable（默认） | detached（`pthread_detach`） |
+| :--- | :--- | :--- |
+| **退出后** | 资源保留，等别人 join | 资源自动回收 |
+| **能否拿返回值** | 能（join 的 retval） | 不能 |
+| **类比进程** | 需要父进程 wait 收尸 | 托给 init 自动收尸 |
+
+---
+
 # 9.2 笔记：signal 和 sigaction
 
 ## 总结
