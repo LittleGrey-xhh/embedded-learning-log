@@ -7,6 +7,158 @@
 
 ---
 
+
+# 9.7 笔记
+
+## 必背
+
+1. **UDP 最大传输数据长度：65507 字节** = 65535（IP 包总长上限，16 位字段）- 8（UDP 首部）- 20（IP 首部）。记忆链：UDP 总长字段是 16 位 → 上限 65535 → 减 IP 头 20 + UDP 头 8 → 应用层一次最多 65507。
+2. **OSI 七层模型（自下而上：物链网传会表应）**：
+
+| 层号 | 层名 | 干什么 | 代表协议/设备 |
+|------|------|--------|--------------|
+| 7 | 应用层 | 人能看懂的数据 | HTTP / FTP / DNS |
+| 6 | 表示层 | 格式转换、加解密、压缩 | TLS、编码 |
+| 5 | 会话层 | 建立/管理/终止会话 | RPC |
+| 4 | 传输层 | 端到端传输，端口号 | TCP / UDP |
+| 3 | 网络层 | 路由选路，IP 地址 | IP / ICMP，路由器 |
+| 2 | 数据链路层 | 相邻节点帧传输，MAC 地址 | 以太网，交换机 |
+| 1 | 物理层 | 比特流走物理介质 | 网线、光纤、集线器 |
+
+面试常问：交换机在二层（看 MAC），路由器在三层（看 IP），TCP/UDP 在传输层；今天写的 socket/UDP 程序在传输层之上。
+
+## 一、干了什么
+
+1. 写 UDP 一发一收 demo（1.server.c / 1.clinet.c），服务器 bind 8888 收客户端消息并打印对方地址端口。
+2. 改成双向通信（2.server.c / 2.clinet.c），服务器收到消息后回包，实现一来一回。
+3. 修了两个 bug：bind 报 `Cannot assign requested address`；服务器收到数据但打印的端口号"不对"（48501）。
+
+## 二、知识点
+
+### 1. bind 报错 `Cannot assign requested address` —— inet_network 字节序坑
+
+`s_addr` 里必须存**网络字节序**的 IP，但 `inet_network` 返回的是**主机字节序**，直接赋值在小端机器上 IP 字节全反：`192.168.172.83` 变成 `83.172.168.192`，本机网卡上根本没这个地址，bind 一查就报错。
+
+**bind 的硬规则：绑定的 IP 必须属于本机某块网卡，否则报 `Cannot assign requested address`。**
+
+前后对比：
+
+```c
+// 改前（错）：字节序反了，等效于绑 83.172.168.192
+server_addr.sin_addr.s_addr = inet_network("192.168.172.83");
+
+// 改后（对）：服务器绑所有网卡
+server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+```
+
+### 2. 三个 IP 转换函数对比
+
+| 函数 | 返回字节序 | 能否直接赋给 s_addr |
+|------|-----------|-------------------|
+| `inet_addr("x.x.x.x")` | 网络字节序 | 能 |
+| `inet_network("x.x.x.x")` | 主机字节序 | 不能（小端机上字节全反） |
+| `htonl(INADDR_ANY)` | 网络字节序 | 能（0.0.0.0 本身无所谓序） |
+
+记住：**`s_addr` 只认 `inet_addr` / `htonl` 的结果，`inet_network` 的返回值永远不能直接给它。**
+
+### 3. 服务器该绑 INADDR_ANY，不该写死 IP
+
+`INADDR_ANY`（0.0.0.0）= 本机所有网卡的该端口都归我监听。写死 IP 的坏处：WSL 的 IP 重启就变，一变就炸。客户端连服务器才需要指定目标 IP，服务器自己不用。
+
+### 4. 客户端不 bind —— 内核自动分配临时端口
+
+现象：服务器打印的对方端口是 48501，不是客户端想用的 6666。
+
+原因：客户端把 `clinet_addr` 结构体填好了但**没调 bind()**，结构体只是个普通变量，内核不知道它存在。不 bind 就 sendto 时，内核在发送瞬间自动做两件事：
+
+1. 查路由表选出走哪块网卡，用那块网卡的 IP 当源 IP；
+2. 从临时端口池抓一个空闲端口绑上去（Linux 范围 32768~60999，48501 正好在里面，所以每次运行端口号还会变）。
+
+| 对比 | 显式 bind | 内核自动 bind |
+|------|----------|--------------|
+| 端口 | 指定，固定不变 | 随机，每次运行都可能变 |
+| 源 IP | 指定 | 按路由自动选网卡 |
+| 适用 | 服务器（必须）、要固定身份的客户端 | 普通客户端 |
+
+实践习惯：**服务器必须 bind（要有固定端口让人找），客户端通常不 bind（避免和其他程序撞端口）**。
+
+### 5. bind 的本质：给 socket 登记本地身份
+
+`socket()` 只创建一个通信端点，此时没有本地地址。`bind` 就是把这个 socket 和一个"名字"（本地 IP + 端口二元组）绑到一起，之后它收发的数据包源地址都是这个身份。不 bind 不是"没有地址"，而是"内核发送时临时发一个随机身份"。
+
+### 6. sockaddr_in 结构体与强制转换
+
+```c
+struct sockaddr_in {
+    sa_family_t    sin_family;   // 协议族 AF_INET
+    in_port_t      sin_port;     // 端口（网络字节序，htons）
+    struct in_addr sin_addr;     // IP（网络字节序，inet_addr/htonl）
+    char           sin_zero[8];  // 填充凑 16 字节，必须 memset 清零
+};
+```
+
+内核 API 只认通用的 `struct sockaddr`（无字段可填），所以实际写法都是：填 `sockaddr_in`，用 `(struct sockaddr *)` 强转传进去。不清零 `sin_zero` 是隐患。
+
+### 7. server_addr 和 client_addr 的角色：一个是输入，一个是输出
+
+| 变量 | 角色 | 数据方向 | 谁来填 |
+|------|------|---------|--------|
+| `server_addr` | 我方身份 / 发送目标 | 你 → 内核 | 自己填（bind 用） |
+| `client_addr` | 对方身份（来电显示） | 内核 → 你 | `recvfrom` 帮你填 |
+
+```c
+recvfrom(socket_udp, buf, sizeof(buf), 0,
+         (struct sockaddr *)&client_addr, &addrlen);  // 内核往盒子里填数据
+printf("%s %d", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+```
+
+规律：**参数前带 `&` 的（client_addr、addrlen）基本都是内核要往回写的出参**。addrlen 传值进去告诉内核盒子多大，返回时被改写成实际长度。
+
+### 8. 服务器回包：收到谁的消息，就回给谁
+
+回包目标不要写死 IP:端口，直接用 `recvfrom` 拿到的 `client_addr`（它就是发送方的真实 IP:端口）。写死的问题：IP 会变；客户端用临时端口时找不到人；多客户端时没法区分。
+
+前后对比：
+
+```c
+// 改前（错，从客户端代码复制来忘了改）
+struct sockaddr_in clinet_addr;
+clinet_addr.sin_addr.s_addr = inet_addr("192.168.172.83");  // 目标：服务器的 IP（注释都还是旧的）
+clinet_addr.sin_port        = htons(6666);
+sendto(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&clinet_addr, sizeof(clinet_addr));
+
+// 改后（对）
+sendto(sockfd, buf, strlen(buf) + 1, 0, (struct sockaddr *)&client_addr, addrlen);
+```
+
+### 9. sendto 的长度参数：sizeof 还是 strlen
+
+`sendto(..., sizeof(buf), ...)` 会把整个 buf 发出去，包括 fgets 没填到的栈上垃圾。应该发实际长度，`+1` 把 `'\0'` 带上让对方能 `%s` 打印：
+
+```c
+sendto(sockfd, buf_send, strlen(buf_send) + 1, 0, ...);
+```
+
+### 10. 出错要退出，perror 不用加 \n
+
+socket/bind 失败只 perror 不 return 的话，后面全是在废 socket 上空转。另外 perror 自带换行，里面写 `\n` 会空两行：
+
+```c
+if(ret == -1){
+    perror("bind error");
+    return -1;
+}
+```
+
+## 三、踩的坑
+
+1. `inet_network` 返回值直接赋 `s_addr`，IP 字节序全反，bind 报 `Cannot assign requested address` —— 坑在第 1、2 点。
+2. 客户端填了地址结构体但没调 bind，以为端口是 6666，实际是内核随机分配的 48501 —— 坑在第 4 点。
+3. 从客户端复制 sendto 代码到服务器忘了改目标地址，注释还写着"目标：服务器的 IP" —— 坑在第 8 点。
+4. `sendto` 用 `sizeof(buf)` 发送，把栈上未初始化的垃圾一起发出去了 —— 坑在第 9 点。
+
+---
+
 # 9.5 笔记
 
 ## 干了什么
