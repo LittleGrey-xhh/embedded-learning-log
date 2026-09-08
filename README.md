@@ -8,6 +8,122 @@
 ---
 
 
+# 9.8 笔记
+
+## 一、干了什么
+
+1. 调试 UDP 广播 demo（broadcast.c / 接收.c）：修好发送端 bind 广播地址的错误，实现全网段广播收发，搞清了"端口到底谁能任意"的问题。
+2. 调试 UDP 组播 demo（server.c / clinet1.c）：区分发送端/接收端各自的组播配置，修掉 setsockopt 用错选项、imr_address 写死 IP、手抄结构体重复定义等问题，最后在 VMware 克隆机上实现了两台虚拟机的组播互通。
+
+## 二、知识点
+
+### 1. bind 绑的是"我是谁"，sendto 填的是"发给谁"
+
+广播地址 `192.168.172.255` 是发往别人的目标地址，本机网卡上根本没有这个地址，拿去 bind 必失败（`EADDRNOTAVAIL` / `EINVAL`）。发送端根本不需要 bind，内核在第一次 sendto 时自动选出口网卡和临时端口；bind 是接收端登记监听端口用的。
+
+**另外 bind 也不能写进循环里**：第一次绑成功后，第二次再绑同一端口会报 `EADDRINUSE`（端口已被自己占了）。
+
+### 2. 广播的端口约定：目标端口两端统一，源端口随意
+
+| 端口 | 谁在用 | 能否任意 |
+|------|--------|----------|
+| 目标端口（发送端 `sin_port`） | 写在包里的"收件人端口" | 不能乱填，必须和接收端 bind 的一致，两端约定统一 |
+| 源端口（发送端自己） | 不 bind 时内核自动分配（32768~60999） | 任意，每次重启程序还会变 |
+| 接收端 bind 的端口 | 本机监听用 | 任意，只要 >1024（0~1023 是特权端口要 root） |
+
+不存在"向所有端口广播"——端口是收件箱号，一个包只能填一个。想全员收到：约定一个公共端口，大家 bind 它。
+
+### 3. 接收端 bind INADDR_ANY = 收全网段
+
+`bind INADDR_ANY:8888` 后，本机所有网卡上到达的、目标端口 8888 的 UDP 包全部交给我，不挑来源 IP，广播和单播都收。`recvfrom` 拿到的 `client_addr` 就是发送方真实 IP:端口（源 IP 是协议栈自动填的发送者身份，源端口是发送端内核分配的临时端口）。
+
+### 4. 广播 vs 组播：投递规则完全不同
+
+| | 广播 | 组播 |
+|---|---|---|
+| 投递规则 | 发到 .255，全网段每个主机都收到一份，再看端口给谁 | 内核在 IP 层先查：这个包的**组地址**我加入过吗？没加入直接丢弃，轮不到看端口 |
+| 能收到的前提 | 对方监听了那个端口 | 对方程序调了 `IP_ADD_MEMBERSHIP` 入组 **且** bind 了同一端口 |
+
+广播是"喇叭喊话人人听得见"，组播是"进群才能收群消息"。组播比广播还省事的一点：发送端连 `SO_BROADCAST` 开关都不用开。
+
+### 5. 组播两端分工：IP_MULTICAST_IF 发，IP_ADD_MEMBERSHIP 收
+
+- 发送端：`IP_MULTICAST_IF` 指定组播包从哪块网卡出去（单网卡环境可以省，内核按路由表自动选；多网卡/走错接口时才需要显式指定）；
+- 接收端：必须 `IP_ADD_MEMBERSHIP` 加入组播组，否则内核直接丢弃组播包，recvfrom 永远阻塞。
+
+```c
+struct ip_mreqn optval;
+optval.imr_multiaddr.s_addr = inet_addr("224.0.0.1");  // 组地址
+optval.imr_address.s_addr   = htonl(INADDR_ANY);       // 本机网卡让内核挑
+optval.imr_ifindex          = 0;
+
+// 发送端（可选）：
+setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &optval, sizeof(optval));
+// 接收端（必须）：
+setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &optval, sizeof(optval));
+```
+
+**imr_address 一律 INADDR_ANY**：写死具体 IP 的代码换台机器跑就报 `No such device`（ENODEV），因为那不是本机的地址。
+
+### 6. setsockopt 失败必须退出，不能只 perror
+
+setsockopt 失败后程序若继续跑，会带着"没入组/没配置好"的状态默默阻塞在 recvfrom——永远收不到数据还以为代码没问题。错误处理三件套：perror + return，让失败立刻暴露。
+
+### 7. struct ip_mreqn 在哪个头文件
+
+`<netinet/in.h>`（glibc，新版本自带完整定义）和 `<linux/in.h>`（内核 UAPI 头）里都有，含 imr_multiaddr / imr_address / imr_ifindex 三个字段。两个头文件都包含时**手抄一遍会报 redefinition**。只有老虚拟机的老 glibc 没有 ip_mreqn，才需要手动定义（注释里说明来源）。
+
+### 8. 组播/广播只在本二层网段内扩散
+
+组播包 TTL 默认为 1，一出本网段就被路由器丢弃。就算把 TTL 调大也没用——普通路由器不转发组播，转发组播需要专门跑 IGMP/PIM 的组播路由器。广播同样跨不了网段。**能 ping 通 ≠ 同网段**：ping 通靠的是路由器转发单播，而广播和组播是二层的活。跨网段想互通只有单播（UDP/TCP 点对点）一条路。
+
+### 9. 收发一体程序：fork 分家，父发子收
+
+单进程里 recvfrom 阻塞会卡死发送循环，标准解法 fork：子进程专职收，父进程专职发。
+
+```c
+// socket 创建后：bind 8888（收组播的目标端口）+ IP_ADD_MEMBERSHIP 入组
+pid_t pid = fork();
+if (pid == 0) {          // 子进程：专职收
+    char buf_rec[128];
+    struct sockaddr_in from;
+    socklen_t len = sizeof(from);
+    while (1) {
+        int n = recvfrom(socket_udp, buf_rec, sizeof(buf_rec) - 1, 0,
+                         (struct sockaddr *)&from, &len);
+        if (n > 0) {
+            buf_rec[n] = '\0';
+            printf("\n[%s:%d] %s\n", inet_ntoa(from.sin_addr), ntohs(from.sin_port), buf_rec);
+            fflush(stdout);
+        }
+    }
+}
+// 父进程：继续原来的发送循环
+```
+
+同机多进程收同一组播：UDP socket 加 `SO_REUSEADDR` 后可以多个 socket bind 同一端口，组播包每家都能收到一份。
+
+### 10. UDP 截断：报文比缓冲大，多的部分直接扔
+
+接收缓冲小于报文长度时，超出部分静默丢弃、不报错。带中文的消息按 UTF-8 每字 3 字节算，接收缓冲开大点（128+）避免消息被拦腰截断。
+
+### 11. VMware 和 WSL 是两套隔离的虚拟网络
+
+VMware NAT（VMnet8）和 WSL2 NAT 即使网段数字撞名（都是 192.168.172.x）也完全隔离，互相 ARP 找不到对方（`Destination Host Unreachable`）。WSL 切 mirrored 模式 + 放开 Hyper-V 防火墙也无法与 VMnet8 打通，这是已知不兼容。
+
+**跨虚拟网络测试的可靠方案**：VMware 里链接克隆一台虚拟机当"第二台机器"（链接克隆引用原机磁盘只存差异，省空间创建快，适合临时实验机），两端挂同一个 VMnet，互 ping 通后组播即通。
+
+## 三、踩的坑
+
+1. 广播发送端 bind 广播地址 → `bind error`。根因：把"发给谁"当成了"我是谁"——坑在第 1 点。
+2. 发送端把 bind 写进 while 循环 → 第二次循环报 `EADDRINUSE`。根因：自己占了自己的端口——坑在第 1 点。
+3. 接收端组播用 `IP_MULTICAST_IF` → 永远收不到，recvfrom 静默阻塞。根因：那是发送端选项，收组播要 `IP_ADD_MEMBERSHIP`——坑在第 5、6 点。
+4. `imr_address` 写死老师代码里的 192.168.63.2 → `setsockopt: No such device`。根因：本机没有这个 IP，内核按地址找网卡找不到——坑在第 5 点。
+5. 手抄 struct ip_mreqn 定义 → `redefinition` 编译错误。根因：netinet/in.h 里已经有了——坑在第 7 点。
+6. 组播"收不到别人发的"：以为 ping 通就能收组播，实际跨网段时组播包根本过不了路由器；本机测试时 VMware 虚拟机和 WSL 又是两套隔离网络，双向 ARP 不通。根因——坑在第 8、11 点，解法是让收发两端进同一个二层网段（VMware 克隆机互测）。
+
+---
+
 # 9.7 笔记
 
 ## 必背
