@@ -7,6 +7,100 @@
 
 ---
 
+# 9.9 笔记
+
+## 一、干了什么
+
+1. 从零摸索 TCP 多任务并发服务器（server.c / clinet1.c / clinet2.c）：评审修正后实现服务器同时服务多客户端、双向收发（定点发送按 IP+端口匹配）。
+2. TCP 文件传输服务器（5.tcp传输文件/server.c）：自己从零写服务端接收 jpg 文件落盘，评审修正 8 处问题，打通"文件收发"场景。
+
+## 二、知识点
+
+### 1. 字节序函数按字段大小选：16 位 s，32 位 l
+
+端口 `sin_port` 是 16 位用 `htons/ntohs`，IP `sin_addr.s_addr` 是 32 位用 `htonl/ntohl`。s=short 2 字节，l=long 4 字节，看字段大小选，不背端口还是 IP。`htons(8888)` 传的是**数字**，不是字符串。
+
+### 2. 标准输入两件套：fgets 用 sizeof，scanf 后清换行
+
+1. `fgets` 第三参数是"最多装多少字节"，必须 `sizeof(buf)`；buf 刚定义时 `strlen(buf)` 为 0，什么都读不到。
+2. `scanf("%hu", &port)` 会在缓冲区残留 `'\n'`，后面紧跟的 fgets 直接读到空行 → scanf 之后补一句 `while(getchar() != '\n');`。
+3. 剪掉 fgets 读到的换行：`buf[strcspn(buf, "\n")] = '\0';`——第二参数是**字符串** `"\n"`，写 `'\n'` 是把字符 10 当指针用，段错误。
+
+### 3. 线程传参：传槽位地址，不传循环变量
+
+`pthread_create(..., Recv_Task, &client_info_arr[idx])`——传**数组槽位的地址**（不是下标）。循环局部变量 `new_socket` 下一轮 accept 就被覆盖，线程拿着它的地址读到的是别人的 fd（竞态）。线程里 `void *arg` 是"拆箱"：`struct client_info *c = (struct client_info *)arg;` 还原类型。没用到参数时写 `(void)arg;` 消 unused 警告。
+
+同进程线程共享内存：客户端只有一个连接，收线程直接用全局 fd，第四参数传 `NULL`；服务器有多个客户端要区分"你是谁的线程"，才传槽位地址。
+
+### 4. 线程资源回收：detach 防"僵尸线程"
+
+joinable 线程退出后资源不自动回收，必须有人 `pthread_join` 收尸；不收尸也不 detach → 每断开一个连接泄漏一份。`pthread_detach(pthread_self())` = "我不要收尸，退出瞬间系统直接回收"。Ctrl+C 杀进程时全部资源由操作系统回收，与此无关——泄漏发生在服务器**长期运行**过程中。严格说"僵尸进程"是 fork 子进程的概念，线程这边是类比。
+
+### 5. _exit 的用法看语境：服务器不能杀全进程，客户端可以
+
+服务器端一个客户端 recv 出错就 `_exit(-1)` → 全部客户端陪葬。正确姿势：close 该 fd + 槽位置回 -1 + 线程退出。客户端只有一个连接，服务器断了程序就没有存在意义 → 直接 `exit(0)` 退出整个进程反而正确。同一个函数，语境不同结论不同。
+
+### 6. recv 不补 '\0'，槽位用 -1 复用
+
+1. `recv` 收到多少就是多少，不会自动补 `'\0'`，按字符串打印前必须 `buf[ret] = '\0'`。
+2. fd 0 是 stdin，槽位"无连接"用 `new_socket = -1` 表示；客户端断开时置回 -1，新连接用 `find_free_slot()` 复用，数组不越界不浪费。
+
+### 7. 客户端四步与 connect
+
+TCP 客户端：socket → bind（可选，这里固定端口是为了让服务器按 IP+端口定位你）→ **connect** → send/recv。connect 成功 = 三次握手完成、双向通道已建立，客户端不需要 listen/accept（那是服务器"被动等人"的前台机制）。客户端收发全双工靠两条执行流：主循环 fgets+send，子线程专职 recv。
+
+### 8. INADDR_ANY 只能 bind，connect 要具体 IP
+
+`INADDR_ANY`(0.0.0.0) 含义是"绑我自己的所有网卡"，只用在 bind 里。connect 的目标是别人的机器，必须写服务器具体 IP（`inet_aton`/`inet_addr`）。inet 系列命名：a=ascii（点分字符串），n=network（网络序二进制）——`inet_aton` 字符串填结构体（写），`inet_ntoa` 网络序转字符串（读），方向和 htons 一套逻辑。注意 `inet_ntoa` 用静态缓冲区，多线程同时调用会串数据，取出后立刻 strncpy 存起来。
+
+### 9. 并发模型：accept 管新客，断开检测全在 recv
+
+服务器三路并行：主循环 accept 接新连接（永不退出，接一个登记一个继续等）、Send_Task 等键盘、每客户端一个 Recv_Task。全双工 = TCP socket 天生双向（内核两个独立方向的缓冲区），程序用两条执行流分别堵在 recv 和 send 上才能同时收发。accept 的成败只看返回值：新 fd（>0）成功，-1 失败查 errno——它和新连接之后断没断没有任何关系，"客人走了"全靠 recv 的返回值发现。
+
+### 10. accept 和 connect 的方向相反
+
+| | 地址结构体谁填 | 方向 |
+|---|---|---|
+| connect（客户端） | 你填服务器的 IP+端口传进去 | 主动发起 |
+| accept（服务器） | 给空壳，内核把对方的 IP+端口填给你 | 被动接 |
+
+### 11. 传输二进制文件：strlen 是头号杀手
+
+jpg 里 `0x00` 是合法字节，`strlen` 在第一个 `\0` 截断 → 写出的文件全是废的。读写长度一律用 `recv`/`read` 的**返回值**。同时 TCP 是字节流、无消息边界，一次 recv 返回小于缓冲区大小是常态，`ret < sizeof(buf)` 不能当"传输完成"——正确的完成信号是 **recv 返回 0**（对端发完 close，FIN 包到达）。
+
+### 12. open 写文件的三个细节
+
+1. `O_CREAT` 必须带第三个参数权限（如 `0666`），否则新建文件权限是栈上的垃圾值。
+2. 标志用按位或 `|`，不是逻辑或 `||`（`O_CREAT || O_WRONLY` 结果恒为 1）。
+3. 收文件加 `O_TRUNC` 清掉旧内容，防上次传输残骸混进去。
+
+### 13. 监听 socket 和通信 socket 是两个 fd
+
+`socket_tcp` 只负责 accept；收发数据必须用 accept 返回的 `new_socket`。对监听 socket 调 recv 收不到任何客户端数据。
+
+### 14. sockaddr 是通用容器，sockaddr_in 是 IPv4 专用填值结构
+
+bind/connect/accept 参数是通用 `struct sockaddr`（一套接口通吃 IPv4/IPv6/Unix 本地），但通用容器没法填字段，实际用 `sockaddr_in` 填值，传参时强转回通用类型 `(struct sockaddr *)&server_addr`，内核按 `sin_family` 认出来。同族：`sockaddr_in6`（IPv6）、`sockaddr_un`（Unix 本地）。
+
+### 15. man 手册检索链
+
+1. 章节号：1 命令、2 系统调用、3 库函数、7 协议与杂项。
+2. 链条：`man 2 bind` → 翻末尾 SEE ALSO → `man 7 ip`（TCP/UDP 编程宝藏页，含 sockaddr_in 全字段和字节序要求）→ 还要源码级细节就 `grep -n "struct sockaddr_in" -A 8 /usr/include/netinet/in.h`。
+
+## 三、踩的坑
+
+1. `htons("8888")` 传了字符串 → 端口变成字符串地址的低 16 位，绑到随机端口。根因——坑在知识点第 1 点。
+2. `for(i < MAX_CONNECTION, i++)` 分号写成逗号 → 逗号表达式值恒真，死循环 + 数组越界。
+3. `main` 里 `int socket_tcp = socket(...)` 遮蔽全局变量 → 收线程里 `recv(0)` 实际在读键盘。根因：线程共享的是全局 fd，被局部变量遮蔽后全局还是 0——坑在第 3 点。
+4. `strcspn(buf, '\n')` 传字符 → int 被当指针解引用段错误。根因——坑在第 2 点。
+5. 把 accept 写成 connect 用法：自己往 clinet_addr 填 IP/端口 → 白填，内核会覆盖。根因——坑在第 10 点。
+6. 二进制写入长度用 `strlen(buf)` → jpg 收到一半全是废数据。根因——坑在第 11 点。
+7. `if(ret < sizeof(buf))` 判断传输完成 → 中途频繁误判。根因：TCP 字节流无消息边界——坑在第 11 点，完成信号是 recv==0。
+8. `O_CREAT || O_WRONLY` 逻辑或 + O_CREAT 不带权限参数 → 文件权限是垃圾值。根因——坑在第 12 点。
+9. `recv(socket_tcp, ...)` 用监听 socket 收数据 → 永远收不到。根因——坑在第 13 点。
+10. 同一函数里 `addrlen` 定义两次 → redeclaration 编译错误。
+
+---
 
 # 9.8 笔记
 
