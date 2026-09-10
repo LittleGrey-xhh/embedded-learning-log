@@ -7,6 +7,119 @@
 
 ---
 
+# 9.10 笔记
+
+## 一、干了什么
+
+1. 全面排查 GEC6818 开发板音频能力：确认 codec 是 **ALC5621**（Realtek，I2S 接口），出厂镜像**没有 ALSA 用户库**，只有 OSS 兼容层 + madplay。
+2. 部署老师提供的 ARM 版 ALSA 包 `科大讯飞\库\alsa_arm.tar.bz`，`arecord` / `aplay` 跑通；对着板子说话实录 30 秒，**峰值 23814（满量程 73%）**。
+3. 语音终端项目开工前摸底：PC 侧 Python 环境、WSL 交叉编译器、板子能否播 32kHz WAV（能）。
+4. 写了 `server/gen_replies.py`（批量生成预置回复音频）。
+
+## 二、知识点
+
+### 1. OSS 和 ALSA 是两套并存的 Linux 音频接口
+
+时间线：
+
+- **1992 OSS**（Open Sound System）：最早的 Linux 音频接口，设备节点 `/dev/dsp`、`/dev/mixer`
+- **2002 ALSA**（Advanced Linux Sound Architecture）进内核：架构更好、支持更多硬件，节点 `/dev/snd/*`
+- **现在**：ALSA 是内核主体，OSS 只剩一个"兼容层"（让老程序还能跑）
+
+两套可以在内核里同时编进去（板子就是这样），**设备节点同时存在、指向同一颗 codec**：
+
+| 用途 | OSS（老） | ALSA（新） |
+|---|---|---|
+| 播放 | `/dev/dsp` | `/dev/snd/pcmC0D0p` |
+| 录音 | `/dev/dsp` | `/dev/snd/pcmC0D0c` |
+| 音量控制 | `/dev/mixer` | `/dev/snd/controlC0` |
+
+命名读法：`pcm` + `C0`(Card 0) + `D0`(Device 0) + `p`/`c`(playback / capture)。
+
+### 2. 为什么 OSS 录不到声音、换 ALSA 就行 —— DAPM 是关键
+
+两条路径在内核里走的是**完全不同的代码路径**：
+
+- **ALSA 路径** → 经过 ASoC 框架 → 里面有 **DAPM**（Dynamic Audio Power Management，动态音频电源管理）。你一打开录音流，DAPM 就**自动把 codec 的模拟通路接好**（麦克风 → 前置放大 → ADC），用完自动拆。
+- **OSS 路径**（兼容层）→ 只做最基本的数据搬运，**不触发 DAPM 的路由配置** → MIC → ADC 那条线始终是断的 → 读到的只有 ADC 自己的量化噪声。
+
+打个比方：**ALSA 是"智能接线员"**，你说要录音它自动把线接好；**OSS 是"只会转的传送带"**，你把桶放上去它照转，但麦克风那头有没有接线它根本不管。
+
+这条解释了我今天折腾很久的那个问题：**把 MICBIAS、ADC 使能、混音器全部手动接通，寄存器层面是对的，但 OSS 路径根本没让 codec 进入正常录音状态**。换 ALSA 后内核一手把 DAPM 全配好，一次就通。
+
+### 3. 8bit 和 16bit 的满量程陷阱
+
+OSS 的默认格式和 ALSA 不一样，**两个数字不能直接比大小**：
+
+| | OSS 默认 | ALSA |
+|---|---|---|
+| 位深 | **8 bit** | **16 bit** |
+| 取值范围 | 0 ~ 255（无符号）| -32768 ~ 32767（有符号）|
+| **静音时的值** | **128**（正中）| **0** |
+| 文件头 | 无（裸 PCM）| 44 字节 WAV 头 |
+
+- OSS 读到的"**恒定 128±2**" = 8bit 下围绕静音点抖 ±2 → 幅度占满量程 `2/256 ≈ 0.8%` → **就是量化噪声**
+- ALSA 读到的"**峰值 23814**" = 占满量程 `23814/32767 ≈ 73%` → **真实声音**
+
+**正确比法是"幅度占满量程的比例"，不是原始数字本身。** 差了快 100 倍，这样说才严谨。
+
+### 4. ALSA 包部署踩的三个坑
+
+1. **扩展名是错的**：`alsa_arm.tar.bz` 实际是 **gzip** 格式 → 用 `tar xzf` 解（tar 能自动嗅探格式）
+2. **Windows 解压会丢符号链接**：`arecord` 其实是 `aplay` 的软链（靠 `argv[0]` 区分录音/放音），Windows 建不了软链 → **必须把 tar 包传到板子上解压**
+3. **libasound 把配置路径编译期写死了**：报 `Cannot access file /home/gec/alsa_arm/share/alsa/alsa.conf` + `Invalid CTL hw:0`，解决办法是把 `share/alsa` 复制到它要的那个路径
+
+### 5. arecord / aplay 参数
+
+```bash
+arecord -d3 -c1 -r16000 -twav -fS16_LE out.wav
+```
+
+| 参数 | 含义 |
+|---|---|
+| `-d3` | **d**uration，录 3 秒 |
+| `-c1` | **c**hannels，1 声道（单声道）|
+| `-r16000` | **r**ate，采样率 16000 Hz |
+| `-twav` | **t**ype，文件类型 WAV（带 44 字节头）|
+| `-fS16_LE` | **f**ormat，**S**igned **16**bit **L**ittle **E**ndian |
+
+**输出格式正好是 whisper 要的 16kHz / 16bit / mono，不需要任何转换。**
+
+### 6. Python 的 venv：解释器和包目录是分开的
+
+- **Python = 解释器（python.exe） + 包目录（site-packages）**，这是一组，不是一样东西
+- 一台机器可以装多个 Python，**每个有自己独立的包目录**，装的库互不可见
+- **venv**（virtual environment）= 给某个项目单独一套解释器 + 独立包目录；`pyvenv.cfg` 是它的身份证
+- 关键项 `include-system-site-packages = false` → 它**完全隔离**，不吃系统的包
+
+**实用操作**：
+
+```bash
+# 1) 确认"当前这个 python 是谁"（怀疑环境不对先跑这个）
+python -c "import sys; print(sys.executable)"
+
+# 2) 本项目统一用 GPT-SoVITS 的 venv（里面 requests / torch 全齐）
+E:\AI训练\GPT-SoVITS\.venv\Scripts\python.exe xxx.py
+```
+
+**报 `ModuleNotFoundError` 时，先怀疑"环境用错了"，别急着 `pip install`** —— 装错地方，回头还会再报一次。
+
+### 7. GPT-SoVITS 的音色由「参考音频」决定
+
+同一个文本、同一套参数，**只换个 `ref_audio_path`，音色就完全变了**。情绪同理（手册原话："几乎完全由参考音频驱动，文本和参数只能小幅带动"）。
+
+今天实测印证：用达妮娅的参考音频 → 像达妮娅；换成 `idle50.wav` + 日文 prompt → 完全不像。
+
+**所以调 TTS 时，先确认参考音频对不对，再去调参数。**
+
+### 8. 排查方法论：先确认驱动路径，再调参数
+
+今天最大的教训。录不到声音时我花了很久改 codec 寄存器（MICBIAS、ADC 使能、混音器全接通），**全部无效**；真正的根因是**走错了驱动路径**（OSS 而非 ALSA）。
+
+**遇到"完全没有信号"这一类问题，先确认数据从哪条路径来，再动手调参数。**
+
+---
+
 # 9.9 笔记
 
 ## 一、干了什么
