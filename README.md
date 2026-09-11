@@ -7,6 +7,205 @@
 
 ---
 
+# 9.11 笔记
+
+## 一、干了什么
+
+1. **换板**（旧板屏幕有问题）：新板整套重新配置 —— 部署 ALSA 用户库、新建 `/etc/init.d/S99myip`（**新板没有 S99iot**）、治理 `/etc/profile`、推 6 条达妮娅预置语音。
+2. 写了 **`build.sh`**（Git Bash / WSL **双模式**，编译→传板→运行，WSL 里 2 秒）+ **`tools/flash.py`**（paramiko 上传；板子没 sftp-server，scp/sftp 都用不了）。
+3. **复现 OSS vs ALSA 录音对照实验**，把故障从"表面现象"逐层逼到"具体层次"。
+4. D1 起步：写 `board/net.c` 的 `send_all` / `recv_all`（评审四轮，编译器**零警告**通过）。
+5. 课堂：手写 HTTP 客户端调聚合天气 API + 简易 JSON 解析，成功拿到数据。
+
+## 二、知识点
+
+### 1. ★ 更正 9.10 的结论：OSS **确实**触发了 DAPM
+
+9.10 笔记里写的是"OSS 兼容层不触发 ASoC 的 DAPM 自动路由配置"——**今天实测发现这句不准确**。
+
+挂上 debugfs 抓实时状态：
+
+```
+静默    : Capture: Off  in 0 out 0
+OSS 录音中: Capture: On   in 1 out 1     ← 它也是 On！
+ALSA 录音中: Capture: On  in 1 out 1
+```
+
+再把三个时刻的 `codec_reg` 全 dump 下来做 diff：**静默 / ALSA录音 / OSS录音，三份完全一致，零差异**。
+
+**所以故障不在路由、也不在 codec 配置**。继续往下找，在 `/proc/asound/card0/oss_mixer` 里看到输入相关的增益（`MIC` / `IGAIN` / `RECLEV`）**全是 0**。
+
+**修正后的结论**：codec 通路是配好的，**问题出在 OSS 兼容层到 PCM 之间的数据通路 / 参数初始化**。要 100% 定论得读内核 `sound/` 下的源码 —— 超出项目范围。
+
+**方法论**：教科书/网上的结论要用实验去验。**"大家都这么说"不等于"在你的板子上成立"。**
+
+### 2. 对照实验的设计：一次只换一个变量
+
+这次实验的价值全在设计上：
+
+| 变量 | 控制 |
+|---|---|
+| 麦克风 | 同一支（板载）|
+| 时间 | 同一时刻（先录 OSS 立刻录 ALSA）|
+| 声源 | 同一次拍手 / 同一段安静 |
+| **驱动路径** | **← 唯一变量**：OSS `/dev/dsp` vs ALSA `arecord` |
+
+```
+OSS  : dd if=/dev/dsp of=/tmp/a.raw bs=8000 count=3
+ALSA : arecord -d3 -c1 -r16000 -twav -fS16_LE /tmp/b.wav
+```
+
+**结果**：
+
+| 指标 | 安静 | 拍手 |
+|---|---|---|
+| OSS RMS（偏离中心 128） | 0.946 | 1.286 |
+| OSS 最大偏离 | 4 | 22 |
+| ALSA RMS | 197.3 | 294.6 |
+| ALSA peak | 863 | **13759** |
+
+**决定性证据在分布上**：拍手时 OSS 有 **97% 的样本仍卡在 126~129**（4 个量化台阶内），偏离 >10 的只有 **0.10%**。
+
+**怎么排除"只是增益太小"**：增益是乘性因子，如果是增益问题，两条路径在拍手时应该**同比例变大**。实测 ALSA 涨了 **16 倍**、OSS 只涨 **1.36 倍** —— 差一个数量级，**排除**。
+
+### 3. DAPM 是什么，怎么在板子上验证它
+
+**DAPM（Dynamic Audio Power Management，动态音频电源管理）** 是 **ASoC（ALSA System on Chip，ALSA 片上系统框架）** 的子系统。
+
+codec 内部有几十个功能单元（输入选择器、混音器、PGA、ADC、DAC），每个都有电源开关寄存器位。**手工配容易漏、不用时还费电**。DAPM 的做法是：驱动只**声明结构**，内核**在打开音频流时自动推导通路并上电**。
+
+驱动声明三样东西：
+
+1. **widget**（部件）：`SND_SOC_DAPM_ADC("ADC", "alc5621-hifi")`
+2. **route**（连接）：`{"ADC", NULL, "REC MIXER"}`
+3. **kcontrol**（部件 ↔ 寄存器位）：`SOC_DAPM_SINGLE("Mic1 Switch", REG, 8, 1, 0)`
+
+**触发链路**：`arecord` → alsa-lib → 内核 `snd_pcm_open` → ASoC 发 `STREAM_START` 事件 → `dapm_power_widgets()` 在 widget 图上做**可达性搜索**，把路径上的单元全部上电。
+
+**板上验证**（这就是"怎么证明它真的在工作"）：
+
+```bash
+mount -t debugfs none /sys/kernel/debug      # ★ 不自动挂载
+cat /sys/kernel/debug/asoc/I2S-alc5623/alc562x-codec.0-001a/dapm/Capture
+```
+
+**关键认知**：`Capture: On` 只表示"采集通路被激活"，**不表示"模拟输入端有信号"**。所以"Capture 是 On 却录不到声音"**完全不矛盾**。
+
+### 4. GEC6818 的 `/etc/profile` 陷阱（换板才发现的）
+
+粤嵌把这套**开机动作**写进了 `/etc/profile`（不是环境变量）：
+
+```
+31: ifconfig eth0 192.168.39.17
+32: telnetd &
+33: source /IOT/driver_ko/insmod_driver.sh
+35-36: cd /IOT; ./iot
+38: mount -t vfat /dev/mmcblk0p7 /project
+```
+
+而 `/etc/profile` 是**每次建立登录 shell 都会执行**的（串口是 `::respawn:-/bin/sh`，SSH 登录也算）。
+
+**后果**：每次连串口 / 每次 SSH，这套东西**重跑一遍** →
+
+- 刷一屏 `insmod: can't insert ... File exists`（驱动已加载过）
+- **`./iot` 是前台程序，一启动就把串口占住** → 必须 Ctrl+C 才能回到 shell
+
+**这让人误以为"板子有重置程序"** —— 其实不是，**是 profile 在每次登录时覆盖**。
+
+**正解**：**开机动作放 `/etc/init.d/S*`（rcS 执行一次）；`/etc/profile` 只放环境变量。**
+
+**注意 `ulimit` 除外** —— 它只对**当前 shell 及其子进程**生效，写进 init.d 脚本等于没写，**必须留在 profile**。
+
+### 5. TCP 是字节流，不是消息流
+
+**TCP（Transmission Control Protocol，传输控制协议）** 只保证"字节不丢、不重、按序到达"，**不保证"一次 `send` 对应一次 `recv`"**。
+
+- **粘包**：两次 `send` 的数据被一次 `recv` 收到
+- **拆包**：一次 `send` 的数据被多次 `recv` 收到
+
+这不是 bug，是 TCP 的本质（内核有发送/接收缓冲区，`recv` 只是"缓冲区里有多少给多少"）。
+
+**解决：长度前缀（length prefix）** —— 自己在应用层划边界：
+
+```
+[4字节总长度(网络序)][1字节type][1字节flag][N字节data]
+```
+
+**五条关键规格**：
+
+1. `send`/`recv` 返回 **`0` 也要当失败**（对端已关闭），不能只判 `< 0`
+2. `bufsz` 是**调用处真实缓冲区容量**，不是"期望收多少"
+3. 长度校验：`total < 2` 或 `total > bufsz + 2` 判非法
+4. 音频长度**必须用 `recv` 返回值**，绝不能用 `strlen`（音频里有 `0x00`）
+5. 多字节整数用 `htonl`/`ntohl` 转**网络序**
+
+**网络序（byte order）**：x86/ARM 是小端（little-endian），TCP/IP 规定网络传输用大端（big-endian）。
+
+```
+0x00000100（256）
+小端内存: [00][01][00][00]
+大端内存: [00][00][01][00]
+直接发内存 → 对端按大端读 → 得到 65536  ✗
+```
+
+### 6. send/recv 返回值的类型坑 + "检查变化量还是累计量"
+
+**坑 1：`size_t ret = send(...)`**
+
+`size_t` 是无符号，接 `-1` 会变成 `SIZE_MAX` → `ret == -1` **永远为假** → 失败时程序继续跑。**返回值必须用 `ssize_t`（有符号）。**
+
+**坑 2：循环条件和 `len -= ret` 混用**
+
+`sent` 累加的同时如果再 `len -= ret`，两者会飞速交叉，条件 `sent < len` **提前变假** → 只发一半就退出。**两种写法二选一，别混。**
+
+**坑 3：要检查"变化量"，别检查"累计量"**
+
+```c
+if (sent <= 0) return -1;   /* ✗ 累计量循环开始时天然是 0 → 第一轮就误报错 */
+if (ret  <= 0) return -1;   /* ✓ 只检查返回值 */
+```
+
+**坑 4：`-Wsign-compare` 警告**
+
+累计量用 `size_t`（要和 `size_t len` 比），返回值用 `ssize_t`。**分工错了，`-1` 会被当无符号转成天文数字。**
+
+**所以**：**`build.sh` 的编译参数加上了 `-Wall -Wextra`**。板子上没有 gdb / strace，**编译期把警告清零是最划算的调试手段** —— 编译器免费帮你抓 bug。
+
+### 7. HTTP 客户端要点（课堂）
+
+**请求格式**：请求行 + 若干首部 + **空行**（`\r\n\r\n`）标志结束：
+
+```
+GET /simpleWeather/query?city=北京&key=xxx HTTP/1.1\r\n
+Host: apis.juhe.cn\r\n
+\r\n
+```
+
+C 里手写 HTTP 就是 `send` 一段拼好的字符串。
+
+**要点 / 坑**：
+
+- URL 里的中文要**百分号编码**（`北京` → `%E5%8C%97%E4%BA%AC`）
+- **`recv` 只调一次不够** —— 响应可能超过一个缓冲区，应按 `Content-Length` 收或循环收
+- **HTTP/1.1 默认 `keep-alive`** —— 不加 `Connection: close`，服务器发完响应**不主动关连接**，你**没法用"读到 0"判断响应结束**
+- **`buf[n] = '\0'`** —— `recv` 收的是字节流不是字符串，必须手动补结束符
+- **`connect` 失败要 `return`** —— 只打印不返回，后续 `send`/`recv` 会用坏 socket
+- `inet_addr` / `gethostbyname` 已过时 → 新代码用 `inet_pton` / `getaddrinfo`
+
+## 三、踩的坑
+
+1. **这版 busybox 的 `timeout` 不认 `SECS` 参数** —— `timeout 12 dd ...` 报 `can't execute '12'`，直接跑命令别包 timeout
+2. **`/proc/asound/card0/` 只有 `id` 和 `oss_mixer`** —— 老内核（3.4.39）没开 `VERBOSE_PROCFS`，拿不到 `hw_params`/`status`
+3. **debugfs 不会自动挂载** —— 要先 `mount -t debugfs none /sys/kernel/debug`
+4. **`pmdown_time` 约 5 秒** —— 停止音频后 codec 延迟掉电，抓"静默态"前必须等够
+5. **`cp -n` 在 busybox 里不存在** —— 备份文件别用 `-n`
+6. **`cat -n` 在 busybox 里不存在** —— 要行号用 `grep -n ""`
+7. **Windows 中文 bat 必须 GBK 编码** —— UTF-8（带不带 BOM 都一样）配 `chcp` 会让 cmd 按字节偏移读错行
+8. **`wsl.exe bash -c` 不读 `~/.bashrc`** —— 交叉编译器 `cc1` 因此找不到 `libmpfr.so.4`，要在命令里显式 `export LD_LIBRARY_PATH`
+9. **WSL 能直接执行 Windows 程序**（interop）—— 所以 WSL 里不用装 paramiko，借 Windows venv 那个即可；但**传给它的路径必须是 Windows 形式**（`E:/...`）
+
+---
+
 # 9.10 笔记
 
 ## 一、干了什么
@@ -827,4 +1026,3 @@ return dummy.next;
 | 删除头节点 | 需要特判并更新 head | prev 从 dummy 出发，统一处理 |
 | 返回值 | head 可能被改，逻辑分散 | 永远 `return dummy.next` |
 | 代码量 | 每个操作多一段特判 | 模板统一，不容易漏边界 |
-
