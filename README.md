@@ -7,6 +7,339 @@
 
 ---
 
+# 9.15 笔记
+
+## 一、干了什么
+
+1. **耳机到了 → 补上 D-0 最后一项遗留**：板子播放的"耳朵确认"。至此硬件层全部验证完毕
+   （麦克风 ✅ / 耳机输出 ✅ / 32kHz 可播 ✅）。
+2. **D3 收口**：服务端 ASR。写 `server/asr.py`（FunASR 封装）+ `server/server.py`
+   （收音频 → 存盘 → 识别 → 打印 → 回固定命令码 9）。
+   真机验收：说"开灯" → PC 终端打印 `[ASR] 开灯`。
+3. **D4 收口**：关键词匹配 + 命令码下发 + GPIO 点灯。
+   - `server/match.py`：停用词 + 关键词表 + `match_cmd()`（**两轮匹配**）
+   - `board/led.c` + `led.h`：用 **sysfs LED 子系统**控制板载 LED
+   - `board/main.c`：收到命令码后 **先点灯，再播语音**
+   真机验收：说"开灯" → 右边一排 4 个灯亮 + 播「好，给你开」；说"关灯" → 灯灭 + 播「收到，关了」。
+4. **写的工具**：`tools/check_chars.py`（扫复制粘贴污染）、`tools/d3_fake_board.py`（假板子，先把服务端单独验通）、
+   `tools/d4_led_timing.c`（`led_set` 耗时探针）、`vpy.bat`（用 GPT-SoVITS 的 venv 跑 Python）。
+5. **探明硬件**：LED 资源（led1~led5）、ALC5621 音量寄存器（手册第 37 页）、耳机插拔检测脚 `gpio-59`。
+6. **4 次 git 提交**：`5ad8e22` / `7367a24`（D3 代码 + 文档）、`baa5cba` / `2f69951`（D4 代码 + 文档）。
+
+## 二、知识点
+
+### 1. ★★ 归一化与关键词保护是**冲突需求** → 分两轮匹配
+
+识别结果要匹配关键词，但"润色"和"保真"是**互相打架**的两件事：
+
+| 需求 | 例子 | 手段 |
+|---|---|---|
+| 清掉废话 | `"帮我开一下灯"` → `"开灯"` | 去掉停用词 |
+| **保住原词** | `"你好"` 不能被拆成 `"好"` | **不能用停用词表去动它** |
+
+`STOP` 表里只要有单字 `"你"`，`"你好"` 就会被拆成 `"好"` → 匹配失败。
+**在一轮里同时满足两个需求的写法必然顾此失彼。**
+
+→ **两轮匹配**：第一轮用**原文**匹配（保护 `你好` / `在吗`），第二轮用**去停用词后的文本**匹配
+（救 `帮我开一下灯`）。两个需求各占一轮，互不干扰。
+
+```python
+def match_cmd(text: str) -> int:
+    # ① 先匹配原文 —— 保护会被停用词拆掉的词
+    for cmd_id, words in KEYWORDS.items():
+        for w in words:
+            if w in text:
+                return cmd_id
+    # ② 再去停用词匹配 —— "帮我开一下灯" → "开灯"
+    t = text
+    for w in STOP:
+        t = t.replace(w, "")
+    for cmd_id, words in KEYWORDS.items():
+        for w in words:
+            if w in t:
+                return cmd_id
+    return 9        # ③ 兜底：匹配不到就说"没听清"，★绝不猜
+```
+
+配套的两条经验：
+- **停用词表里别放单字**（`我` / `你`）——"帮我"这类多字短语已经覆盖了它们的场景，单字纯风险
+- **词表要含变体**：`"麻烦把灯打开"` 归一化后是 `"灯打开"`，只写 `"打开灯"` 会漏（**字序不同，子串对不上**）
+
+### 2. ★★ 为什么 4 个灯看起来"同步"：2.82ms vs 人眼 16ms
+
+程序里就是老老实实循环：`for (i=1;i<=4;i++) led_set(i,1);` —— **没有同步机制**。
+实测（探针 `tools/d4_led_timing.c`）：
+
+| 项 | 值 |
+|---|---|
+| 单次 `led_set`（open+write+close） | **0.1 ms**（首次 0.315ms = 路径冷启动）|
+| 一轮 4 次总耗时 | **2.82 ms** |
+| 人眼"两个闪光是否同时"的分辨阈值 | **约 16 ms** |
+| 余量 | **5.7 倍** → 感知为同时 |
+
+三个值得记住的结论：
+- **单次测量不代表批量**：连续 4 次平均 0.7ms，比单测的 0.1ms 大 7 倍（调度 / 内核锁抖动）
+- **术语**：这个循环**不是原子操作**——中间任何时刻都可能被调度打断，高速相机能拍到依次亮。
+  只是"人类这台传感器"分辨率只有 16ms。
+- 加 `sleep(1)` 就是**流水灯**（探针第 3 部分实测演示过）
+
+### 3. ★ ASR 选型：**领域指标 ≠ 通用指标**
+
+答辩话术：**"我不追求 ASR 的字准率，我追求关键词召回率。"**
+
+数据（用 `server/replies/*.wav` 6 条做测试集，文本写在 `gen_replies.py` 里 = 天然 ground truth）：
+
+| 指标 | FunASR paraformer-large | faster-whisper small |
+|---|---|---|
+| 总体 CER（字错率） | 17.02% | 19.15% |
+| 平均耗时/条 | **0.23s** | 0.42s |
+
+**17% 为什么不影响项目**：
+
+| 错误位置 | 例子 | 对项目影响 |
+|---|---|---|
+| 语气词 | `开咯` → `开了` | 无 |
+| 专有名词 | `达妮娅` → `丹尼亚` | 无（除非做唤醒词）|
+| **实词（关键词）** | `开`/`关`/`灯`/`收到`/`没听清` | **全部正确** ✅ |
+
+→ 通用 CER 高不高，**不决定**关键词匹配任务成不成。**要选对衡量指标，别被通用指标绑架。**
+（真正的判据是 D3/D4 的真机验收：真人说"开灯"→ 识别"开灯"，**关键词召回 2/2 = 100%**。）
+
+### 4. ★ VAD 判静音 → 返回空串，**这是正常行为不是 bug**
+
+VAD（Voice Activity Detection，语音活动检测）会把静音段剪掉。喂一段纯底噪：
+推理 0.31s 正常结束，**返回空字符串**。
+
+→ 所以 `asr()` 的**返回空串是合法结果**，调用方必须处理：
+`if not text:` 就打印"未识别到语音"，而不是当异常。
+
+（反面提醒：真人说"开灯"只有 1~3 秒，如果出现"说了话却识别为空"，先拉 `d3_last.wav` 自己听——
+听着清楚 = VAD 剪过头了，去调阈值；听着就不清楚 = 录音问题，别去动模型。）
+
+### 5. stdout 与 stderr：PyCharm 里的**红字不是错误**
+
+| 流 | 内容 | PyCharm 显示 |
+|---|---|---|
+| **stdout** | 我自己 `print()` 的 | 正常色 |
+| **stderr** | 库的日志、警告 | **红色** |
+
+那些红字全部来自 `funasr` / `modelscope` / `torch` / `jieba`（Python 的 `logging` 和 `warnings`
+默认都往 stderr 写）。**判据：出现 `Traceback` 才是真错**；`Warning`/`Notice`/`INFO`/`ckpt:` 都是噪音。
+
+与 D2 的"`aplay` 输出走 stderr、读板子输出要 `2>&1`"是**同一个知识点**。
+
+### 6. ★ sysfs 的"文件即接口" + LED 子系统
+
+内核把硬件控制暴露成**文件**：`cat` 读状态、`echo >` 写命令。C 里就是 `open`/`write`/`close`。
+
+```c
+snprintf(path, sizeof(path), "/sys/class/leds/led%d/brightness", led_no);
+int fd = open(path, O_WRONLY);
+write(fd, on ? "1" : "0", 1);      /* 实测不带换行也能成功 */
+close(fd);
+```
+
+**两种控制 LED 的方式，选上层那条**：
+
+| 路线 | 接口 | 结果 |
+|---|---|---|
+| **sysfs LED** ✅ | `/sys/class/leds/ledN/brightness` | 内核标准 `leds-gpio` 驱动已就绪，一行写入搞定 |
+| sysfs GPIO | `export` → `direction` → `value` | ❌ gpio-71/72/81 **已被 leds-gpio 占用** → `Device or resource busy` |
+| 粤嵌 `/dev/Led` | misc 字符设备（私有格式）| 得翻厂商驱动源码，换板子就废 |
+
+**"能用高层抽象就别碰底层"** —— 跟"用 `fopen` 而不用 `open`"是同一个判断。
+面试点：`/sys/class/gpio` 是旧接口（正在被 libgpiod / 字符设备取代），而 LED 子系统是另一条正路。
+
+### 7. Python 的"名字"要看清指向什么 + 作用域
+
+`asr.py` 里有两个**模块级名字**，长得像但完全不同：
+
+```python
+model = funasr.AutoModel(...)      # 变量 —— 指向一个"模型对象"
+def asr(wav_path, ...):            # 函数 —— 我要用的是它
+```
+
+- `from asr import model` → 拿的是**那个对象**
+- `from asr import asr` → 拿的才是**函数**
+- `model.asr(...)` → 在那个对象身上找 `asr` 方法 → **AutoModel 没有这个方法**（只有
+  `build_model/export/generate/inference/inference_with_vad`）→ `AttributeError`
+
+**作用域**（和 C 一样）：
+
+| 位置 | 何时执行 | 能看到什么 |
+|---|---|---|
+| 模块顶层 | **import 时执行一次** | 只有模块级的东西 |
+| 函数内部 | **每次调用时执行** | 自己的局部变量 + 模块级的 |
+
+所以 `cmd_id = match_cmd(text)` 写在模块顶层会 `NameError` —— `text` 是函数内的局部变量。
+**它必须放在函数里、`text = asr(...)` 之后。**
+
+👉 实用习惯：在 IDE 里敲 `model.` 看**补全列表**（= `dir(obj)`），列表里没有就是没有——
+比报错后再查快得多。
+
+### 8. 模型为什么要"模块级加载一次"
+
+```python
+# asr.py 顶层
+_model = AutoModel(model=..., vad_model=..., device="cuda")   # ← 放这里
+print("ASR 模型已加载", flush=True)
+```
+
+Python 的 import 机制：**模块代码只在第一次 import 时执行，之后走 `sys.modules` 缓存**。
+所以写在顶层 = 服务端**启动时加载一次**；写进 `asr()` 函数里 = **每次调用重载 7~25 秒**。
+
+（加载耗时实测：冷启动 23s，热启动 7~9s。这个"启动慢但只慢一次"是服务端的常规取舍。）
+
+### 9. Windows 上 venv 的"启动器"机制
+
+`Get-Process` 看到监听 8888 的进程路径是 `D:\python\python.exe`，一度以为用错了解释器。
+真相：**`venv\Scripts\python.exe` 只是个启动器**——它读 `pyvenv.cfg`、拉起 base 解释器，
+但把 `sys.prefix` 指向 venv，从而加载 venv 的 `site-packages`。
+所以"进程路径显示 base 解释器"是正常的，包仍来自 venv。
+
+### 10. "先做动作，再播语音"——用户体验层面的设计
+
+同样的代码，顺序一换，演示效果差一个档次：
+
+| 顺序 | 观感 |
+|---|---|
+| 播语音 → 点灯 | 听完"好，给你开"，还要等 1~2 秒灯才亮 → **慢半拍** |
+| **点灯 → 播语音** ✅ | 说"开灯" → **灯立刻亮**，声音紧跟 → 符合直觉 |
+
+**这不是代码对错问题，是设计判断**——答辩时可以讲"我考虑的是用户感知"。
+
+## 三、踩的坑
+
+### 1. ★ 机器上有三个 Python，只有一个装了 funasr
+
+报 `ModuleNotFoundError: No module named 'funasr'` 时**先别改代码**，先问"当前是哪个解释器"：
+
+```bash
+python -c "import sys; print(sys.executable)"
+```
+
+| 解释器 | 路径 | funasr |
+|---|---|---|
+| 系统 3.11.4（**PyCharm 默认指向它**）| `D:\python\python.exe` | ❌ |
+| WorkBuddy 托管 3.13 | `~\.workbuddy\binaries\python\versions\3.13.12\` | ❌ |
+| **GPT-SoVITS venv** | `E:\AI训练\GPT-SoVITS\.venv\Scripts\python.exe` | ✅ 1.0.27 |
+
+### 2. ★ PowerShell **不从当前目录找程序**，必须写 `.\`
+
+```powershell
+PS> py server\asr.py        # ✗ 命中的是系统 C:\WINDOWS\py.exe（Python 启动器）
+PS> .\vpy.bat server\asr.py # ✓ 加 .\ 才找当前目录
+```
+
+原因：PowerShell 出于安全考虑不搜当前目录（防止 `cd` 到陌生目录敲个 `ls` 就执行了别人放的 `ls.exe`）。
+cmd 是个历史例外（它隐式搜当前目录）。**同一个文件在 cmd 里直接敲 `vpy` 就行。**
+本项目因此把脚本改名 `vpy.bat`（避开系统的 `py.exe`）。
+
+### 3. ★ HTML 实体残留会毁掉 `if __name__ == "__main__":`
+
+从网页/聊天窗口复制代码会带进 `&#8203;`（**看着就是 6 个普通字符**，所以"找不可见字符"的工具
+反而扫不出来）→ `"__&#8203;main__"` ≠ `"__main__"` → **自测块一声不响地不执行**。
+
+**排查手法：字符串比较和预期不符时，别瞪着屏幕看，去比字节。**
+工具：`tools/check_chars.py`（同时查 HTML 实体残留 / 零宽字符 / NBSP / 全角空格 / BOM）。
+
+### 4. `from asr import model` 拿的是对象，不是函数
+
+详见知识点 7。三处错误（import 拿错 / 调用不存在的方法 / 传 int 当 bytes）**同源**：
+**"这个名字指向什么类型"没搞清楚。** Python 没有类型声明，全靠自己清楚或者用 `dir()` 查。
+
+### 5. `send_packet(conn, PKT_CMD, 9)` → `TypeError`
+
+`send_packet` 内部第一行是 `total = len(data) + 2` → `len(9)` 直接崩。
+
+```python
+bytes([9])   # ✓ 从 int 造一字节 —— 1 个字节 0x09
+b"9"         # ✗ 这是 ASCII 字符，字节值 0x39 = 57！板子会收到命令码 57
+```
+
+对照 C：`uint8_t b = 9; send(sock, &b, 1, 0);` —— Python 就是 `bytes([9])`。
+
+### 6. ★ 单字停用词把关键词自己吃掉
+
+`STOP` 里有 `"你"` → `"你好"` 归一化后变 `"好"` → 匹配失败返回"没听清"。
+详见知识点 1（两轮匹配）。
+
+### 7. ★ `write` 失败分支漏 `close(fd)` —— **D2 讲过的坑重演**
+
+```c
+ret = write(fd, ...);
+if (ret == -1) { perror(...); return -1; }   // ← fd 没关就跑了
+close(fd);                                    // ← 只有成功路径才关
+```
+
+**修法：先 `close` 再判错**（只剩一个出口，想漏都漏不掉）：
+
+```c
+ret = write(fd, on ? "1" : "0", 1);
+close(fd);                    /* ★ 用完立刻关 */
+if (ret <= 0) { perror("write error"); return -1; }
+return 0;
+```
+
+复习 D2 那句：**"`fclose` 用完立刻还，别拖到函数尾，否则新增失败分支必漏。"**
+
+### 8. `snprintf` 的截断判断用 `>` 是错的
+
+返回值是"**本该写入的长度（不含 `'\0'`）**"，所以判断要含那个 `'\0'`：
+
+```c
+if (ret < 0 || (size_t)ret >= sizeof(path)) { /* 被截断 */ }
+```
+
+- 用 `>` 会漏判：`ret = 50`、缓冲区 50 时，实际需要 51 字节，而 `50 > 50` 为假
+- `int` 与 `size_t` 直接比较会被 **`-Wsign-compare`** 抓到（编译警告，本次实测命中）
+
+顺带：**`perror` 不能跟 `snprintf` 用** —— `snprintf` 失败**不设置 `errno`**，
+`perror` 会打印上一次无关的错误信息，把人引偏。
+
+### 9. ★ 猜寄存器：地址和极性**都猜反了**
+
+以为 `0x02` 是耳机音量、以为 `0x00` 是最小档，直接写 `0x1f1f`。翻手册（`数据手册/ALC5621.pdf` 第 37 页）：
+
+```
+8.3. Reg-04h: Headphone Output Volume        ← 耳机是 0x04，不是 0x02！
+Note: For HPR/HPL, 00h: 0dB attenuation   1Fh: 46.5dB attenuation
+```
+
+**事实完全相反**：`0x02` 是 Speaker 音量；`0x00` 是 **0dB（最大）**，`0x1F` 才是 46.5dB（最小）。
+所以出厂 `04: 0000` 本来就是满音量——耳机链路一直正常，**"没声音"的真实原因是耳机没插到位**。
+
+**教训：寄存器位定义必须查手册，不能靠"约定俗成"猜。** 手册一直躺在项目目录里。
+
+（本次收获的硬件事实：耳机插拔检测脚 `gpio-59 (hp-gpio)`，`hi` = 未插 / `lo` = 已插。）
+
+### 10. `build.sh` 传板偶发 `TimeoutError`
+
+现象：传板报 `连不上板子 ... TimeoutError`，但板子 `ping` 通、SSH banner 正常、负载 `0.00`、
+认证只需 0.5 秒 → **瞬时抖动，重试即可**，别花时间排查。
+
+（同类：D2 的"SSH 读输出要 `2>&1`"、D3 的"Python 相对路径跟 CWD 走不跟脚本走"——
+都是"看着像大问题、其实是小误会"的坑，**先做最小验证再动大手术**。）
+
+### 11. 改了 Python 文件但服务端没重启
+
+`server.py` / `match.py` 改完，旧进程还在跑（监听 8888）→ 板子拿到的永远是**旧代码的行为**。
+现象是"匹配没生效"，实际是**没加载新代码**。
+→ 改完先看 `netstat -ano | findstr 8888`，确认旧进程停了再起新的。
+
+## 四、遗留
+
+1. **D5 健壮性**（板子端 C）：`main.c` 加 `while(1)` 大循环 / 断线重连（每次新建 socket）/
+   `SO_RCVTIMEO` 收发超时 / 录音失败不崩 / 服务端写 `log.txt`。
+2. **三件套**：README（五块：架构图 / 协议说明 / 运行步骤 / **踩坑记录** / 量化数据）、
+   演示视频（2~3 分钟，四个场景）、PPT（五点）。★ 验收打分大头，不可压缩。
+3. `board/main.c` 的 D2 遗留小改：`open` 失败要 `return -1`／`n == -1` 改 `n <= 0`／
+   `char buf_cmd` 改 `uint8_t`／`cmd_id` 初值 99 改 9。
+4. `pc_sim/net.c` 是 `board/net.c` 的旧副本（已分叉）→ 改成 `-I../board ../board/net.c` 只留一份真源。
+
+
+---
+
 # 9.14 笔记
 
 ## 一、干了什么
