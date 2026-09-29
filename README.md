@@ -15,13 +15,13 @@
 2. **继续搞 PCB 沉金艺术画**：学习并打样了莫宁的艺术画(立创开源链接[text](https://oshwhub.com/southbarn/project_goffojsc?jspm=hub.ss.lb.gc4&jlc_vid=QVZdV1JQElhcU1dSRFUNVlMEFFhdUwdeTlRWUlZfRwUxVlNfR1dbVFBSRVhWXzsOAxUeFF5JWAIASQYPGQZABAsLWD4BFAwRHxQMSQcJGg%3D%3D))，另外千咲的 Gerber 上传嘉立创被退回（提示「资料外形不明确」），查出来是板框层里混了多余的辅助线，删掉后重新打包（但还是有问题）；以及搞清了「6 层免费券能不能用来打艺术画」和「沉金为什么贵、不沉金是什么效果」。
 
 **原理图**
-![TypeC 接口板原理图](<img width="1228" height="690" alt="Image" src="https://github.com/user-attachments/assets/5a67b470-fabe-4dc9-86d5-c1e8df853ccf" />)
+![TypeC 接口板原理图](https://github.com/user-attachments/assets/5a67b470-fabe-4dc9-86d5-c1e8df853ccf)
 
 **PCB（顶层）**
-![TypeC 接口板 PCB](<img width="1039" height="540" alt="Image" src="https://github.com/user-attachments/assets/03850d89-7250-4658-952e-a28c5915b818" />)
+![TypeC 接口板 PCB](https://github.com/user-attachments/assets/03850d89-7250-4658-952e-a28c5915b818>)
 
 **3d视图**
-![TypeC 接口板3d图](<img width="1004" height="556" alt="Image" src="https://github.com/user-attachments/assets/1dcd84d5-4d77-4bac-9921-c264c9270bb9" />)
+![TypeC 接口板3d图](https://github.com/user-attachments/assets/1dcd84d5-4d77-4bac-9921-c264c9270bb9>)
 
 ---
 
