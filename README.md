@@ -18,10 +18,10 @@
 ![TypeC 接口板原理图](https://github.com/user-attachments/assets/5a67b470-fabe-4dc9-86d5-c1e8df853ccf)
 
 **PCB（顶层）**
-![TypeC 接口板 PCB](https://github.com/user-attachments/assets/03850d89-7250-4658-952e-a28c5915b818>)
+![TypeC 接口板 PCB](https://github.com/user-attachments/assets/03850d89-7250-4658-952e-a28c5915b818)
 
 **3d视图**
-![TypeC 接口板3d图](https://github.com/user-attachments/assets/1dcd84d5-4d77-4bac-9921-c264c9270bb9>)
+![TypeC 接口板3d图](https://github.com/user-attachments/assets/1dcd84d5-4d77-4bac-9921-c264c9270bb9)
 
 ---
 
