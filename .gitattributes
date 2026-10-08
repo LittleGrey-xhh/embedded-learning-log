@@ -1,0 +1,4 @@
+# 统一换行符，避免 Windows 本地 CRLF 与仓库 LF 反复整文件 diff
+* text=auto eol=lf
+*.png binary
+*.jpg binary

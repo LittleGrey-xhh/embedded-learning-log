@@ -38,6 +38,9 @@ NAV="> 📒 历史月份：${NAV% ·}"
 rm -rf "$REPO/归档"
 cp -r "$ARCHIVE" "$REPO/归档" 2>/dev/null
 
+# 维护指南一起进仓库，保证 README 顶部的 learning-log-guide.md 链接可跳转
+cp "$NOTES/learning-log-guide.md" "$REPO/learning-log-guide.md"
+
 cd "$REPO" || exit 1
 git add -A
 git commit -m "$(date '+%Y-%m-%d') 更新日记"
