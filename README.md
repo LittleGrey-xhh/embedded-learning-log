@@ -6,6 +6,190 @@
 > 格式规范见 [learning-log-guide.md](learning-log-guide.md)，新条目写在本标题下方（最新在最上面）。
 
 ---
+# 11.5 笔记
+
+## 一、干了什么
+
+1. 从零建起 `02_EXTI` 工程，摸清 ESP-IDF 的工程结构和 `idf_component_register` 三个参数各管什么。
+2. 把按键从"主循环轮询"改成"GPIO 中断 + 队列 + 任务"，第一次跑通事件驱动的完整链路。
+3. 顺着 `driver/gpio.h` 和 `esp_timer.h` 两次找不到的经历，把"组件依赖"这套机制查明白。
+4. 对着原理图逐个核对板上三颗按键的真实引脚和上下拉，修正了原先对 KEY1/KEY2 的误判。
+5. 理清 ESP32 的中断入口为什么跟 STM32 完全不同（查表 vs 向量表）。
+
+---
+
+## 二、知识点
+
+### 1. ★★★ `idf_component_register` 三个参数各管什么
+
+```cmake
+idf_component_register(SRCS "main.c" "led.c"
+                       INCLUDE_DIRS "."
+                       PRIV_REQUIRES esp_driver_gpio esp_timer)
+```
+
+| 参数 | 填什么 | 路径相对谁 |
+|---|---|---|
+| `SRCS` | **自己写的** `.c` 文件 | 组件目录（`main/`） |
+| `INCLUDE_DIRS` | **自己写的**头文件所在目录 | 组件目录（`main/`） |
+| `PRIV_REQUIRES` | **别人的**组件名，不是文件名 | —— |
+
+口诀：**前两个说"我有什么"，后两个说"我要谁的"**。
+
+`SRCS` 是白名单，不列进去的文件压根不参与编译，也不会出现在 `compile_commands.json` 里。ESP-IDF 没有"自动收集目录下所有 .c"这回事。
+
+`SRC_DIRS` 能扫目录，但源码里写的是 `file(GLOB "${abs_dir}/*.c")`：**只扫一层不递归**，且不带 `CONFIGURE_DEPENDS`，新增文件后必须 `idf.py reconfigure` 才生效。所以文件少时老老实实列 `SRCS`。
+
+`REQUIRES` 和 `PRIV_REQUIRES` 的区别：判据是**你的 `.h` 里 include 了谁**。只在 `.c` 里 include 的写 `PRIV_REQUIRES`；写在公开头文件里的写 `REQUIRES`（因为依赖你的人也得看得见）。`main` 是顶层组件没人依赖它，一律 `PRIV` 就够。
+
+### 2. ★★★ `xxx.h: No such file` = 组件没声明，不是路径问题
+
+ESP-IDF 里能不能 include 成功，只看**该文件的编译命令里有没有对应的 `-I` 目录**，跟文件在不在硬盘上无关。而 `-I` 目录是构建系统按 `PRIV_REQUIRES` 算出来的。
+
+三步自查：
+
+```bash
+# 1. 这个头属于哪个组件
+cd /e/a2_QianRuShi/ESP/v5.5.5/esp-idf/components
+ls */include/esp_timer.h
+# → esp_timer/include/esp_timer.h   → include 前面那层就是组件名
+
+# 2. 看现在写了什么
+cat main/CMakeLists.txt
+
+# 3. 加上再 build（CMakeLists 变了会自动 reconfigure，不用删 build）
+```
+
+通配符只替换组件名那一层，`include/` 后面的路径要原样带上：`#include "driver/gpio.h"` 就查 `ls */include/driver/gpio.h`。
+
+常用对照：
+
+| 头文件 | 组件名 |
+|---|---|
+| `driver/gpio.h` | `esp_driver_gpio` |
+| `driver/i2c_master.h` | `esp_driver_i2c`（5.x 老名字 `driver/i2c.h` 已删） |
+| `driver/spi_master.h` | `esp_driver_spi` |
+| `nvs_flash.h` | `nvs_flash` |
+| `esp_timer.h` | `esp_timer` |
+| `esp_log.h` / `freertos/*` | 公共依赖，**不用写** |
+
+### 3. ★★★ ESP32 的 GPIO 中断是"查表"，STM32 是"向量表"
+
+| | STM32 | ESP32 |
+|---|---|---|
+| 硬件中断源 | 每个引脚组一个（`EXTI15_10` 等） | **所有 GPIO 共用一个** |
+| 入口绑定 | 编译期写死，链接器填向量表 | **运行期**查数组 `gpio_isr_func[]` |
+| 怎么知道是哪个脚 | 自己在回调里比 `GPIO_Pin` | 驱动读状态寄存器拿位图 |
+| 清中断标志 | 软件写 `EXTI->PR`（写 1 清零） | **驱动替你清** |
+| 使能 | `EXTI->IMR` + `NVIC_EnableIRQ` | `gpio_intr_enable()` |
+
+ESP32 的驱动里，`gpio_isr_func` 是一张**按引脚号索引的数组**，每项存 `fn` 和 `args`。中断来时读状态寄存器拿到位图，位号直接当数组下标取，所以虽然是"查表"但仍是 O(1)，没有遍历开销。
+
+STM32 里中断标志**不清会死循环**：ISR 退出后 `EXTI->PR` 还是 1，NVIC 看到挂起标志立刻再次进同一个中断，程序卡死在中断里，主循环一行都不跑（"中断风暴"）。ESP32 没这个坑，驱动在你回调返回后统一清。
+
+### 4. ★★★ "关 → 填 → 开" 只发生在注册阶段
+
+`gpio_isr_handler_add()` 内部三步：
+
+```c
+gpio_intr_disable(gpio_num);                                 // 关这个脚的中断
+gpio_isr_func[gpio_num].fn   = isr_handler;                  // 填函数地址
+gpio_isr_func[gpio_num].args = args;                         // 填原样保存的参数
+gpio_intr_enable_on_core(gpio_num, ...);                     // 开
+```
+
+**为什么必须先关**：填表是两条语句，中间可能被中断打断。如果那时中断来了，驱动会读到"`fn` 已经是我的函数、`args` 还是 NULL"的半成品，直接崩。
+
+中断真正触发时**只查表不填表**，整个程序寿命里"填"只做一次。
+
+`args` 存的意义：驱动只知道"0 号脚触发了"，不知道你管它叫 KEY1。把当初登记的参数原样传回去，两个键才能共用同一个回调、靠 `arg` 区分。
+
+### 5. ★★ ISR 的三条铁律
+
+1. **不能 `printf`**。ISR 借的是被打断任务的栈，没有任务控制块，而 `printf` 内部要拿锁、要动态分配——这些在中断上下文里没有意义甚至崩。
+2. **只能用 `FromISR` 版 API**。`xQueueSendFromISR` 而不是 `xQueueSend`，因为前者不会阻塞。
+3. **结尾要 `portYIELD_FROM_ISR(hp)`**。不写也能工作，但任务要等到下一个 tick 才被唤醒，默认 tick 100Hz 就是最多延迟 10ms。
+
+`hp` 是**局部变量**，每次进中断都重新初始化为 `pdFALSE`，**不需要用完清零**。写成 `static` 才是错的——它会一直保留上次的 `pdTRUE`，导致每次中断都强制切任务。
+
+`IRAM_ATTR` 的真正原因：ESP32 的代码默认在**外部 Flash**，靠 Cache 映射执行。写 Flash（NVS 保存、OTA）时 Cache 必须关闭，Flash 里的代码全都取不出来，此时来中断就崩。放 IRAM 等于给个安全屋。**但只有中断用 `ESP_INTR_FLAG_IRAM` 分配时才必须**；默认标志（`gpio_install_isr_service(0)`）时 Flash 操作期间中断本来就被屏蔽了，加不加都行，属于好习惯。
+
+### 6. ★★ 事件驱动 vs 轮询
+
+```c
+// 轮询：每 500ms 主动问一次"按了吗"
+vTaskDelay(pdMS_TO_TICKS(500));
+if (gpio_get_level(KEY1_PIN) == 0) ...
+
+// 事件驱动：按键那一刻才被叫醒
+xQueueReceive(g_queue_key_handle, &key_state, portMAX_DELAY);
+```
+
+轮询的根本问题是**采样间隔决定漏检**——按住的时长小于 500ms 就完全抓不到。而按 500ms 以内采样，CPU 又全耗在空转上。
+
+`portMAX_DELAY` 让任务在队列空时彻底挂起，一个指令都不执行，CPU 拿去跑别的任务。有数据时调度器唤醒它，把数据**拷贝**进缓冲区。
+
+队列深度 5 意味着最多缓存 5 个事件，满了 `xQueueSendFromISR` 返回 `errQUEUE_FULL`，事件就丢了。
+
+### 7. ★★ 消抖必须做在 ISR 里，时间戳必须 `static`
+
+机械触点在闭合瞬间会弹跳，产生好几个下降沿。一次按键就能把深度 5 的队列灌满。
+
+```c
+static int64_t last_ms = 0;
+int64_t now = esp_timer_get_time() / 1000;   // 微秒转毫秒
+if (now - last_ms < 20) return;
+last_ms = now;
+```
+
+`static` 是这里的关键：把变量放进 `.bss`，函数退出不销毁，下次进中断还是上次的值。不加就变成每次都是 0，消抖完全失效。
+
+`esp_timer_get_time()` 返回上电以来的微秒数，它是 ISR 安全的（实现在 IRAM，只读硬件计数器）。
+
+**两个键共用同一个 `last_ms` 会互相吞**：KEY1 触发后 20ms 内按 KEY2，KEY2 被当抖动丢掉。严格做法是按引脚分开存：`static int64_t s_last_ms[GPIO_NUM_MAX]`。
+
+### 8. ★★ 对着原理图核对：GPIO0 是 BOOT 键，不是用户键
+
+| 网络标号 | 芯片引脚 | 按键 | 外部上拉 |
+|---|---|---|---|
+| `IO0_BOOT` | 27（GPIO0） | SW2 | **R2 10kΩ → 3V3** |
+| `IO11` | 20（GPIO11） | SW3 | **R111 10kΩ → 3V3** |
+| `RESET` | EN | SW1 | —— |
+
+板上就三颗键：复位、BOOT、用户键。**用户键是 GPIO11，GPIO0 是 BOOT 键。**
+
+由此得三个结论：
+
+1. `key.c` 里 `.pull_up_en = GPIO_PULLUP_DISABLE` 是**对的**。外部已经有 10k 上拉，再开内部上拉属于重复。
+2. 下降沿触发也对：松开 = 3V3（高），按下 = GND（低）。
+3. GPIO0 是 strapping 脚（启动模式选择），但**有 10k 上拉**，正常上电不按键就是高电平，能正常启动。只有上电/复位那一瞬间正好按着，才会进下载模式。所以风险没想象中大，但这颗键本来就设计成 BOOT 用，拿它做普通按键容易在调试时误触。
+
+---
+
+## 三、踩的坑
+
+1. **新建 `.c` 没进 `SRCS`**，我以为放到 `main/` 目录下就会自动编译。实际编译的还是旧的 `hello_world_main.c`，固件时间戳暴露了真相——新代码再没进过编译。
+2. **`driver/gpio.h` 报找不到时，我以为是 include 路径没配好**。真因是 `PRIV_REQUIRES` 里只有模板遗留的 `spi_flash`，没写 `esp_driver_gpio`。晚上加消抖又因为 `esp_timer.h` 踩了同一个坑第二次，说明第一次只是照着改，没真正理解机制。
+3. **`gpio_install_isr_service(0)` 等三条语句写在函数外面**。`main.c` 和 `exti.c` 各犯一次。C 的文件作用域只允许函数定义、变量定义、宏和声明，语句一律不许出现。
+4. **`portYIELD_FROM_ISR` 拼成 `prortYIELD_FROM_ISR`**。这种错只能靠编译器抓，但报错信息不直观，容易盯半天。
+5. **`exti.h` 里我把 `queue.h` 写在 `FreeRTOS.h` 前面**，直接触发 `#error "include FreeRTOS.h" must appear in source files before "include queue.h"`。FreeRTOS 的 queue/task/semphr 都有这个顺序检查。
+6. **`IRAM_ATTR` 在头文件声明和 .c 定义各写了一次**，警告 `ignoring attribute 'section (".iram1.1")' because it conflicts with previous 'section (".iram1.0")'`。这个宏展开带 `__COUNTER__`，每次展开值都不同，段名就对不上。
+7. **主循环轮询和中断队列同时控制 LED**。两条路互相覆盖，按一次键灯的状态取决于谁后执行。中断改造时我忘了把旧的轮询删掉。
+8. **`key_irq_init`、`task_led`、两个句柄全都只写了"用"没有"定义"**。编译报一整片 undeclared，本质是函数还没写完就急着调。
+
+---
+
+## 四、遗留
+
+1. **消抖的时间戳还是两键共用**，改成按引脚索引的数组。
+2. **队列满时事件被静默丢弃**，`xQueueSendFromISR` 的返回值没检查。
+3. **顶层 `project()` 还是 `01_basic`**，固件名和目录名对不上，容易拿错固件去烧。
+4. **KEY1/KEY2 建议对调**：让普通用户键（GPIO11）当 KEY1，把 BOOT 键（GPIO0）挪到 KEY2，避免误触进下载模式。
+5. **还没实际烧录验证**。目前只做到语法全过，链接和运行期都还没跑。
+6. 按键只做了"按下"响应，没有长按、双击这些扩展——等基础跑通再说。
+
+---
+
 # 11.4 笔记
 
 ## 一、干了什么
