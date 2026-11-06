@@ -6,6 +6,187 @@
 > 格式规范见 [learning-log-guide.md](learning-log-guide.md)，新条目写在本标题下方（最新在最上面）。
 
 ---
+# 11.6 笔记
+
+## 一、干了什么
+
+1. 拿到别人给的 I2C 工程（`04_I2C/01_I2C_PCA9557`），一打开满屏报错，顺着查清了 ESP-IDF 工程到底由哪几层组成。
+2. 把上一份工程当模板复制出新练习工程（`05_LCD/07_I2C_TP`），验证"补 `.vscode` + 删 build"这套流程能直接跑通。
+3. 对比了 ESP32 的 FT6336 触摸代码和之前 GEC6818 上自己写的 `touch_input.c`，搞清两者到底差在哪一层。
+4. 补 I2C 的概念：主从关系、地址寻址、读寄存器的完整时序，以及这条总线上挂的两颗芯片各是什么。
+5. 学 PWM：ESP32 的 LEDC 怎么配，跟 STM32 的 TIM 差在哪，用呼吸灯把两边写法都过了一遍。
+
+---
+
+## 二、知识点
+
+### 1. ★★★ ESP-IDF 工程分四层，别人的包里永远缺第三层
+
+| 层 | 是什么 | 别人的包里 | 换机器要动吗 |
+|---|---|---|---|
+| 源码层 | `main/*.c`、`main/*.h`、`CMakeLists.txt` | 有 | 不用 |
+| 芯片层 | `sdkconfig`（里面是 `CONFIG_IDF_TARGET`） | 有 | 换芯片要重配 |
+| **本机层** | **`.vscode/`**（IDF 装在哪、串口号、target） | **通常没有** | **必换** |
+| 产物层 | `build/` | 有时被打包进来 | **必删** |
+
+`.vscode/` 不是工程的一部分，是"这台电脑的身份证"。ESP-IDF 插件靠它里面的 `idf.currentSetup` 判断"这是个 IDF 工程"，缺了就**不注入 include path**，C/C++ 满屏红线；同时 CMake Tools 插件会自己拿本机 mingw64 的 gcc 去 configure，多出一个错的 `build/`。
+
+所以正确做法是：**每台电脑维护一份 `.vscode` 母版，所有工程共用，新工程直接复制**。只有三个字段可能变：`idf.currentSetup`（IDF 路径）、`idf.customExtraVars.IDF_TARGET`（芯片型号）、`idf.port`（串口号）。
+
+`build/` 必须删的理由：里面的 `CMakeCache.txt` 和 `compile_commands.json` 全是别人机器的绝对路径。CMake 看到路径没变就认为"不用重新配置"，继续用错工具链。
+
+### 2. ★★ I2C 只需要 4 个函数，读和写的区别就一句话
+
+```
+写： S | 地址+W | 寄存器号 | 数据 | P
+读： S | 地址+W | 寄存器号 | Sr | 地址+R | 数据 | P
+```
+
+| 函数 | 干什么 |
+|---|---|
+| `i2c_new_master_bus()` | 铺一根线（配 SCL/SDA 引脚 + 时钟） |
+| `i2c_master_bus_add_device()` | 往线上挂一台设备，登记地址，拿到 `dev` 句柄 |
+| `i2c_master_transmit(dev, buf, len, to)` | 只发不收（写） |
+| `i2c_master_transmit_receive(dev, &reg,1, data,1, to)` | 先发寄存器号再收数据（读） |
+
+**总线是总线，设备是设备。** 建完总线只拿到总线句柄；挂完设备才拿到设备句柄。以后所有读写都用设备句柄，不再用总线句柄。
+
+**一条总线可以挂多个从机，靠 7 位地址区分。** 这块板上：
+
+- `PCA9557` = `0x19`，I2C 转 8 个 GPIO 的扩展芯片，管 `LCD_CS` / `PA_EN` / `DVP_PWDN` 这类开关脚
+- `FT6336` = `0x38`，触摸控制 IC
+
+PCA9557 就三个寄存器：`0x00` 输入（只读）、`0x01` 输出、`0x03` 配置（**写 1 = 输入，写 0 = 输出**，容易记反）。
+
+**主机的真身是 ESP32 内部的 I2C 控制器外设**，不是 CPU 核心直接怼。所以配置时要指定 `i2c_port`（用 I2C0 还是 I2C1）。
+
+### 3. ★★ 触摸屏：FT6336 和 gslX680 差的是"一整层内核驱动"
+
+| | ESP32 / FT6336 | GEC6818 / gslX680 |
+|---|---|---|
+| 数据怎么来 | 自己的代码调 `i2c_master_transmit_receive()` 读寄存器 | `read()` 读 `/dev/input/event0` 的 `struct input_event` |
+| 读什么 | `0x02` 触摸点数，`0x03~0x06` 四字节坐标 | `EV_ABS/ABS_X`、`EV_ABS/ABS_Y`、`EV_KEY/BTN_TOUCH` |
+| 数据形态 | **一次拿到完整快照** `{state,x,y}` | **事件流**，一个动作拆成好几条 |
+| 谁驱动 | 自己 `while(1)` 轮询 | LVGL 定时器回调 `read_cb`，被动被拉 |
+| 芯片校验 | 读 4 个 ID 寄存器验明正身 | 不用管，内核验过了 |
+| 输出 | 自定义 `tp_data_t` | `lv_indev_data_t`，直接喂 LVGL |
+
+分层看就一句话：
+
+```
+GEC6818：芯片 → [内核驱动] → evdev 事件队列 → 你的 touch_input.c → LVGL
+ESP32  ：芯片 → 你的 tp.c → 自定义结构体
+```
+
+**ESP32 上做的事，等于把"内核驱动 + evdev"两层的活自己干了。** 换算下来，`tp.c` 那 200 行里跟 LVGL 有关的只有最后几行，其余 150 行都在当驱动用。
+
+接 LVGL 只差一个回调：
+
+```c
+static void tp_read_cb(lv_indev_t *indev, lv_indev_data_t *data)  // LVGL 每次刷新会调这个
+{
+    tp_data_t s;                                    // 装一次读到的快照
+    tp_read_xy(&s);                                 // 调自己的驱动拿坐标
+    data->point.x = s.x;                            // 填 X
+    data->point.y = s.y;                            // 填 Y
+    data->state = (s.state == TP_STATE_PRESS)       // 按下还是松开
+                  ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+```
+
+### 4. ★★★ PWM 的 `duty` 是"高电平占比"，亮度方向由 LED 极性决定
+
+这是今天最容易搞混的一点，两层要分开算：
+
+1. `duty` 是**高电平占整个周期的比例**（官方示例：13 位下 `duty = 4096` 就是 50%）
+2. LED 亮不亮看**引脚是低电平还是高电平**（本板低电平点亮）
+
+所以对这块板：
+
+| duty（10 位 0~1023） | 引脚输出 | 灯 |
+|---|---|---|
+| `0` | 恒低 | **全亮** |
+| `1023` | 恒高（实际约 99.9%） | **全灭** |
+
+**STM32 那边反而是 CCR 越大越亮**，因为 `OCPolarity = LOW` 把"有效电平"定义成了低电平，`CCR` 越大低电平越长。两边数值含义相反，照抄代码会得到反方向的呼吸。
+
+解法：ESP32 用 `ledc_channel_config_t` 里的 `.flags = { .output_invert = 1 }` 把输出反相，之后就是"数值大 = 引脚低 = 亮"，跟 STM32 的直觉一致。
+
+### 5. ★★ LEDC 配置三步，第三步不能省
+
+```c
+// 1. 定时器：定频率和分辨率，可被多个通道共用
+ledc_timer_config_t timer_cfg = {
+    .speed_mode      = LEDC_LOW_SPEED_MODE,   // 低速模式
+    .timer_num       = LEDC_TIMER_0,          // 定时器 0
+    .duty_resolution = LEDC_TIMER_10_BIT,     // 10 位 → 占空比 0~1023
+    .freq_hz         = 5000,                  // 5kHz
+    .clk_cfg         = LEDC_AUTO_CLK,         // 时钟源自动选
+};
+ledc_timer_config(&timer_cfg);
+
+// 2. 通道：绑定时器 + 绑定引脚
+ledc_channel_config_t ch_cfg = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,        // 必须跟定时器一致
+    .channel    = LEDC_CHANNEL_0,             // 通道 0
+    .timer_sel  = LEDC_TIMER_0,               // 用哪个定时器（决定频率）
+    .gpio_num   = GPIO_NUM_10,                // 输出引脚
+    .duty       = 1023,                       // 初始占空比
+    .hpoint     = 0,                          // 相位起点
+    .flags      = { .output_invert = 1 },     // 输出反相
+};
+ledc_channel_config(&ch_cfg);                 // 配完就自动输出，没有单独的 Start
+
+// 3. 改占空比：两句必须成对
+ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 500);  // 只写影子寄存器
+ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);    // 这一句才推到引脚
+```
+
+**`ledc_update_duty()` 忘了写，现象是"代码在跑但灯一动不动"。** STM32 写 CCR 是立即生效的，ESP32 不是。
+
+还有一个细节：10 位分辨率下最大只能写 `1023`，而 `1023/1024 ≈ 99.9%`，所以**永远到不了真正的 100%**，灯不会完全灭（或完全亮），差一丝。
+
+### 6. ★ STM32 的 TIM 和 ESP32 的 LEDC 对照
+
+| 维度 | STM32（TIM1） | ESP32（LEDC） |
+|---|---|---|
+| 外设性质 | 通用定时器，PWM 是它的一种模式 | 专用 PWM 外设 |
+| 频率怎么定 | `Prescaler` + `Period` 两个数算出来 | 直接写 `freq_hz` |
+| 分辨率 | 由 `Period` 隐含（999 → 10 位） | 显式声明 `duty_resolution` |
+| 改占空比 | `__HAL_TIM_SET_COMPARE()`，立即生效 | `ledc_set_duty()` + `ledc_update_duty()` |
+| 启动 | `HAL_TIM_PWM_Start()` | 通道配置完自动跑 |
+| 引脚绑定 | CubeMX 选引脚 → 配复用 | 通道配置时直接写 `gpio_num` |
+| 互补输出/死区 | 硬件自带（CH1/CH1N、BDTR） | 没有 |
+
+RTOS 下两边还有两个差异：
+
+1. **入口身份**：STM32 要 `main()` → `osKernelStart()`，业务代码必须放进任务；ESP32 的 `app_main()` **本身就是 FreeRTOS 任务**，可以直接写 `while(1)`。
+2. **tick 频率会影响 `pdMS_TO_TICKS()`**：ESP-IDF 默认 `CONFIG_FREERTOS_HZ=100`，1 tick = 10ms，`pdMS_TO_TICKS(2)` 算出来是 **0**，`vTaskDelay(0)` 只是让出 CPU 不延时。要精确到毫秒级得把 tick 改成 1000，或者不用延时计时、改用 `esp_timer_get_time()` 读时间戳判断。
+
+---
+
+## 三、踩的坑
+
+1. **目录名把 PWM 写成了 `PWN`**，结果自己去找 PWM 代码时抓了 `03_PWN/01_PWN` 这个工程，里面压根没有 `pwm.c`，白问了一轮。
+
+2. **以为"必须先把 I2C 和 PWM 都补完才能看 LCD 项目"**。实际那个工程里 7 个 `.c` 有 5 个是死代码（`led` / `key` / `exti` / `pwm` / `pca9557` 全没被 `main.c` 调用），真正生效的只有 4 个函数。看这种"大杂烩工程"的正确姿势是先看 `main.c` 调了什么，不是从第一个文件读起。
+
+3. **换工程时想把 `.vscode` "移"过去**。那是移不是复制——原工程还要继续用。`.vscode` 属于机器不属于工程，所以是复制一份过去，两边各留一份。
+
+4. **照抄 STM32 的呼吸循环会得到反方向**。STM32 是 `CCR` 越大越亮，ESP32 默认是 `duty` 越大越暗（因为本板低电平点亮）。要先把 `output_invert` 打开再抄，否则看到的是"从亮渐变到灭"。
+
+---
+
+## 四、遗留
+
+1. I2C 的 30 行验证程序（读 FT6336 的 `0xA8` 寄存器，期望 `0x11`）还没烧进板子跑。
+2. `03_PWN/02_PWM` 的呼吸灯工程还没烧，不知道实物方向对不对。
+3. `07_I2C_TP` 的触摸只到"串口打印坐标"，还没接到 LVGL 上。
+4. PCA9557 那三个 IO 到底接的是什么，代码注释是原作者写的，要对着原理图核一遍。
+5. PWM 的非阻塞写法（`esp_timer_get_time()` 判断时间戳）还没试，目前用的还是 `vTaskDelay`。
+
+---
+
 # 11.5 笔记
 
 ## 一、干了什么
