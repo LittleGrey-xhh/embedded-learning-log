@@ -115,14 +115,33 @@ PYEOF
 cd "$REPO"
 git add -A
 if git diff --cached --quiet; then
-    echo "没有变更，跳过提交"
+    echo "没有新变更"
+else
+    git commit -q -m "$(date '+%Y-%m-%d') 更新学习日记"
+    echo "已提交"
+fi
+
+# ---------- 6. 推送 ----------
+# ★★ 这一段必须独立于"有没有新变更"。
+#   2026-11-21 踩过：原来写成「没有变更就 exit 0」，结果本地积压的提交永远推不上去，
+#   手动跑 sync.sh --push 也只打印"跳过提交"就退出，看着像成功。
+if [ "$DO_PUSH" -ne 1 ]; then
+    echo "（未推送，要推加 --push）"
     exit 0
 fi
-git commit -q -m "$(date '+%Y-%m-%d') 更新学习日记"
-echo "已提交"
-if [ "$DO_PUSH" -eq 1 ]; then
-    git push
-    echo "已推送"
+
+AHEAD=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 1)
+if [ "$AHEAD" -eq 0 ]; then
+    echo "远程已是最新，无需推送"
 else
-    echo "（未推送，要推加 --push）"
+    echo "有 $AHEAD 个提交待推送"
+    if git push; then
+        echo "已推送"
+    else
+        echo "!!! 推送失败。常见原因："
+        echo "    1. 证书吊销检查失败（CRYPT_E_NO_REVOCATION_CHECK）→ 换网络重试"
+        echo "    2. 网络不通 → 确认能打开 github.com"
+        echo "    本地提交已保留，网络恢复后重新执行本脚本即可补推"
+        exit 1
+    fi
 fi
