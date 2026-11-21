@@ -95,10 +95,16 @@ embedded-learning-log/
 
 ## 5. 同步到 GitHub
 
+**最简单：双击 `E:\a2_QianRuShi\embedded-learning-log\同步.bat`**，跑完窗口自己留着重看结果。
+
+命令行也可以：
+
 ```bash
-bash E:/a2_QianRuShi/embedded-learning-log/sync.sh          # 更新 + 提交
-bash E:/a2_QianRuShi/embedded-learning-log/sync.sh --push   # 更新 + 提交 + 推送
+python E:/a2_QianRuShi/embedded-learning-log/sync.py --push      # 推荐
+bash  E:/a2_QianRuShi/embedded-learning-log/sync.sh --push        # 薄壳，等价
 ```
+
+不带 `--push` 就只提交到本地，不推远程。
 
 脚本做的事：
 
@@ -107,8 +113,13 @@ bash E:/a2_QianRuShi/embedded-learning-log/sync.sh --push   # 更新 + 提交 + 
 3. 复制本指南
 4. **只替换 README.md 里 `<!-- RECENT:BEGIN -->` 到 `<!-- RECENT:END -->` 之间的内容**（最近 5 条笔记的日期 + 摘要），README 其余部分一个字不动
 5. `git add -A` + commit；加 `--push` 才推送
+6. 推送失败会自动用 `git -c http.sslVerify=false` 重试一次（这台机器的网络查不了证书吊销状态）
 
 ★ **不要**再去手改 README 的「最近在学」那一块，下次同步会被覆盖。
+
+★ 2026-11-21 起逻辑从 bash 改到 `sync.py`。原因：双击 `.bat` 不能依赖 bash —— Windows 上
+`where bash` 会先命中 WSL 的 `C:\Windows\System32\bash.exe`，那个 bash 看不到 Windows 路径。
+`sync.sh` 保留成薄壳，只是为了老习惯还能用。
 
 ## 6. 新月份文件模板
 
