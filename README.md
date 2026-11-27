@@ -10,10 +10,10 @@
 
 | 领域 | 掌握内容 | 落地项目 |
 |---|---|---|
-| **STM32 裸机** | GPIO / EXTI / TIM（PWM、定时中断）/ I2C / SPI / UART / ADC+DMA | SCARA 码垛机械臂、CO₂ 监测仪 |
+| **STM32 裸机** | GPIO / EXTI / TIM（PWM、定时中断）/ I2C / SPI / UART / ADC+DMA | [SCARA 码垛机械臂](https://github.com/LittleGrey-xhh/scara-palletizing-arm)、CO₂ 监测仪 |
 | **RTOS** | FreeRTOS 任务划分、队列（覆盖式/不丢失）、二值信号量、中断优先级约束 | LoRa + MQTT 智慧农业网关 |
 | **通信协议** | LoRa P2P 私有帧、MQTT 3.1.1、串口命令协议、AT 指令透传、TCP 长度前缀分帧 | 智慧农业双板、ESP32 音视频终端 |
-| **运动控制** | 平面二连杆逆运动学（余弦定理）、梯形加减速、回零状态机、舵机脉宽标定 | SCARA 码垛机械臂 |
+| **运动控制** | 平面二连杆逆运动学（余弦定理）、梯形加减速、回零状态机、舵机脉宽标定 | [SCARA 码垛机械臂](https://github.com/LittleGrey-xhh/scara-palletizing-arm) |
 | **上位机 / 工具** | Python + pyserial、示教-复现序列、串口双口同步抓取、Keil 工程批量维护脚本 | `arm_teacher.py`、`serial_monitor.py` |
 | **开发环境** | STM32CubeMX / Keil MDK AC5 / arm-none-eabi-gcc / ESP-IDF / CMake 交叉编译 | — |
 | **硬件** | 原理图解读、嘉立创 EDA 画板与审板、万用表排障、焊接 | USB-C 受电接口板、5V→12V 升压 |
@@ -25,10 +25,10 @@
 
 | 项目 | 内容 | 状态 |
 |---|---|---|
-| **立柱式 SCARA 码垛机械臂** | 四轴 + 丝杆升降，STM32F103 逆运动学与运动控制，示教-复现上位机。Z 轴回零重复性 0.0125mm、单次落点误差 5mm | 开源整理中 |
+| **[立柱式 SCARA 码垛机械臂](https://github.com/LittleGrey-xhh/scara-palletizing-arm)** | 四轴 + 丝杆升降，STM32F103 逆运动学与运动控制，示教-复现上位机。Z 轴回零重复性 0.0125mm、单次落点误差 5mm | 已开源 |
 | **LoRa + MQTT 智慧农业** | 中控板 + 终端板双板，FreeRTOS 三任务双队列，私有 9 字节控制帧，云端小程序下发 | 开源整理中 |
 | **ESP32-S3 语音交互终端** | 基于开源小智固件的二次开发，定位并修复 8 处并发 / 内存 / 协议栈缺陷 | 开源整理中 |
-| **GEC6818 ARM Linux 语音助手** | 板端采集与界面 + PC 端 FunASR 识别，自定义 TCP 协议、断线重连 | 课程设计 |
+| **[GEC6818 ARM Linux 语音助手](https://github.com/LittleGrey-xhh/arm-linux-voice-terminal)** | 板端采集与界面 + PC 端 FunASR 识别，自定义 TCP 协议、断线重连 | 已开源 |
 | **[Synares 病毒排查实录](https://github.com/LittleGrey-xhh/synares-incident-report)** | Windows 主机宏病毒感染的一次完整应急响应（已脱敏） | 已开源 |
 
 ---
